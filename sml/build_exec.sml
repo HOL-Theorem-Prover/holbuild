@@ -2228,8 +2228,9 @@ fun hol_run_file_arg stage file =
 val last_child_status : OS.Process.status option ref = ref NONE
 
 (* When the latest HOL child of run_hol_files_to_log started (ms since the
-   epoch), for its holload; NONE for a child started otherwise.  A load
-   ahead's join moves it past the child's waits for late parents. *)
+   epoch), for its holload: when its machine memory reservation was granted,
+   so a wait for memory is not HOL's; NONE for a child started otherwise.  A
+   load ahead's join moves it past the child's waits for late parents. *)
 val last_child_start : LargeInt.int option ref = ref NONE
 
 (* When that child ended, as its parent saw it; NONE until it has. *)
@@ -2239,6 +2240,12 @@ val last_child_end : LargeInt.int option ref = ref NONE
    exec-action's holdriver; NONE once a load ahead's child, started before
    the hol phase, has joined it. *)
 val hol_children_ms : LargeInt.int option ref = ref (SOME 0)
+
+(* How many of those children were admitted under machine memory
+   reservations, and the milliseconds they waited for it, which their
+   holload leaves out: exec-action's holadmit. *)
+val hol_children_admitted = ref 0
+val hol_children_admission_ms = ref (0 : LargeInt.int)
 
 (* HOL's `use` remembers a source parse error in the heap and, with
    failOnError set as `hol run` sets it, exits with failure after the next
@@ -2320,6 +2327,17 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
     val started = Time.toMilliseconds (Time.now ())
     val _ = last_child_start := SOME started
     val _ = last_child_end := NONE
+    (* The child is the only one this process admits meanwhile: a load
+       ahead's driver starts none while its child runs. *)
+    val admissions_before = !HolbuildMachineMemory.admissions
+    val admission_before = !HolbuildMachineMemory.admission_ms
+    fun start_at_admission () =
+      let val admission = !HolbuildMachineMemory.admission_ms - admission_before
+      in
+        last_child_start := Option.map (fn start => start + admission) (!last_child_start);
+        hol_children_admitted := !hol_children_admitted + !HolbuildMachineMemory.admissions - admissions_before;
+        hol_children_admission_ms := !hol_children_admission_ms + admission
+      end
     val tool_env =
       (case !tool_cache_dir of SOME dir => ["HOLBUILD_TOOL_CACHE_DIR=" ^ dir] | NONE => []) @
       (case !scratch_input_paths of
@@ -2335,10 +2353,12 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
          HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @
          hol_context_args context @ file_args)
         log
+      before start_at_admission ()
       handle HolbuildToolchain.Error msg =>
-        if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.child_completed) then
-          raise HolbuildActionSandbox.Error msg
-        else raise Error msg
+        (start_at_admission ();
+         if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.child_completed) then
+           raise HolbuildActionSandbox.Error msg
+         else raise Error msg)
     val _ = last_child_status := SOME status
     val ended = Time.toMilliseconds (Time.now ())
     val _ = last_child_end := SOME ended
@@ -13451,8 +13471,8 @@ fun merge_phases phases =
    the lines; a value that isn't a nonnegative integer is dropped.  Each
    line in which HOL says it refused a theory's module counts one
    holmodrefusedn.  holload runs from CHILD_START, when the child that
-   wrote the log started, to its first runtime install (the least
-   holloadend: a runtime loaded again later prints its line first), less
+   wrote the log was admitted to start, to its first runtime install (the
+   least holloadend: a runtime loaded again later prints its line first), less
    the preload's save (holsave in a line without holloadend); without a
    runtime install, to the script's start (holscriptstart, which the stage
    prints whether or not the script is instrumented).  holscript runs from
@@ -17916,6 +17936,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
              script_start_file, "holbuild-export-theory.sml"]
         val outcome : exn option option ref = ref NONE
         val started = Time.now ()
+        val admission_before = !HolbuildMachineMemory.admission_ms
         val _ = prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
 
         val _ =
@@ -17940,7 +17961,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val waited_ms = ref (0 : LargeInt.int)
         (* aheadwait: the time the child spent in its waits, each from its
            entry (waiting-P, finishing) to its marker (or to now, for one
-           still waiting); aheadload: the rest of its preload. *)
+           still waiting); aheadload: the rest of its preload, less its wait
+           for admission, which holadmit reports. *)
         fun record_timings () =
           let
             val now = Time.now ()
@@ -17953,9 +17975,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                      in waited ("waiting-" ^ name, getOpt (Option.map #2 (List.find (fn (n, _) => n = name) (!arrivals)), now)) end)
                   late
             val wait = List.foldl op+ (waited ("finishing", getOpt (!released, now))) parents
+            (* The child is the only one this process admits meanwhile. *)
+            val admission = !HolbuildMachineMemory.admission_ms - admission_before
           in
             waited_ms := wait;
-            phases := ("aheadwait", wait) :: ("aheadload", LargeInt.max (0, ms (getOpt (!released, now), started) - wait)) :: !phases
+            phases := ("aheadwait", wait) ::
+                      ("aheadload", LargeInt.max (0, ms (getOpt (!released, now), started) - wait - admission)) :: !phases
           end
         val deadline = Time.+ (started, !ahead_wait_limit)
         (* Polls READY every INTERVAL while the child runs. *)
@@ -18363,7 +18388,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               fun count (name, n) = if !n > 0 then [(name, LargeInt.fromInt (!n))] else []
               val drops = count ("rstdropn", dropped_checkpoints) @ count ("rstmodrejn", rejected_heap_modules) @
                           count ("pubckptn", published_checkpoints)
-              val _ = phases := rev (hol_phases @ !resume_steps @ drops) @ !phases
+              val admission =
+                if !hol_children_admitted = 0 then [] else [("holadmit", !hol_children_admission_ms)]
+              val _ = phases := rev (admission @ hol_phases @ !resume_steps @ drops) @ !phases
               val merged = merge_phases (rev (!phases))
               (* The hol phases' time outside their HOL children: the
                  driver's own, around and between the children. *)
