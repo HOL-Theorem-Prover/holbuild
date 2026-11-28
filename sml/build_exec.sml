@@ -16558,10 +16558,11 @@ fun prefetch_modules remote root tc wanted =
     handle e => warn ("theory modules not prefetched: " ^ General.exnMessage e)
 
 (* Tool caches (build --tool-cache NAME).  A theory child may keep files in
-   HOLBUILD_TOOL_CACHE_DIR that a later action with the same dependencies and
-   toolchain can reuse on any worker: the worker restores them from the
-   remote cache before the child runs, and publishes them after it, whether
-   or not the build succeeded.  The directory is flat and holds at most
+   HOLBUILD_TOOL_CACHE_DIR that a later action with the same dependency
+   outputs and toolchain can reuse on any worker. The key uses the same
+   dependency context as the shared heap. The worker restores the files
+   before the theory script runs and publishes them after it, whether or
+   not the build succeeded. The directory is flat and holds at most
    tool_cache_max_files files of tool_cache_max_bytes in all; a tool writes
    each file whole (to a temporary name, then renamed), as a failed build's
    files are published too; a link or special file there fails the
@@ -16570,9 +16571,9 @@ val tool_cache_header = "holbuild-tool-cache-v1"
 val tool_cache_max_files = 16
 val tool_cache_max_bytes = 256 * 1024 * 1024
 
-fun tool_cache_key (spec : action_spec) name =
+fun tool_cache_key (spec : action_spec) deps_key name =
   HolbuildHash.string_sha256
-    (String.concat [tool_cache_header, "\nname=", name, "\ndeps_key=", #deps_key spec,
+    (String.concat [tool_cache_header, "\nname=", name, "\ndeps_key=", deps_key,
                     "\ntoolchain=", action_text_value spec "toolchain"])
 
 fun tool_cache_failure (Error msg) = msg
@@ -16930,16 +16931,21 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     (* The hydrate's steps, after it in the report, also when it fails. *)
     fun add_hydrate_steps () = phases := !hydrate_steps @ !phases
     fun add_restore_steps () = phases := !restore_steps @ !phases
-    fun setup_tool_cache (spec : action_spec) =
+    fun prepare_tool_cache_dir name =
+      let val dir = FS.fullPath root ^ "/.holbuild/tool-cache/" ^ name
+      in
+        ensure_dir dir;
+        tool_cache_dir := SOME dir;
+        dir
+      end
+    fun setup_tool_cache (spec : action_spec) deps_key =
       case #tool_cache spec of
           NONE => NONE
         | SOME name =>
             let
-              val key = tool_cache_key spec name
-              val dir = FS.fullPath root ^ "/.holbuild/tool-cache/" ^ name
+              val key = tool_cache_key spec deps_key name
+              val dir = prepare_tool_cache_dir name
             in
-              ensure_dir dir;
-              tool_cache_dir := SOME dir;
               SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote (share_store cache) key dir))
             end
     (* A theory child reads each scratch input in place, the local cache's
@@ -17552,8 +17558,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   | NONE => ())
                before drop_heap_snapshot ())
               handle e => (drop_heap_snapshot (); raise e)
-            val tool_cache =
-              (case ahead of SOME {tool_cache, ...} => tool_cache | NONE => setup_tool_cache spec)
+            (* A load-ahead child is still behind the preload barrier.
+               Restore from the final dependency context before its join
+               lets it run the theory script. *)
+            val tool_cache = setup_tool_cache spec (#deps_key action)
               handle e => (release_heap_decline (); raise e)
             val _ = (if Option.isSome ahead then () else stage_scratch_input spec)
                     handle e => (release_heap_decline (); raise e)
@@ -17725,7 +17733,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               SOME hash => hash
             | NONE => raise Error ("no hash recorded for " ^ path)
         val source_text = read_text (in_root root (action_source_path package (#path (#source spec))))
-        val tool_cache = setup_tool_cache spec
+        val _ = Option.app (ignore o prepare_tool_cache_dir) (#tool_cache spec)
         val _ = stage_scratch_input spec
         (* The stage's names don't depend on the deps context. *)
         val action = spec_theory_action root spec (cutoff_context spec NONE)
@@ -18077,7 +18085,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                run_plain spec tc false false)
             fun build_ahead pipelined =
               build spec tc false cutoff
-                (SOME {source_text = source_text, tool_cache = tool_cache,
+                (SOME {source_text = source_text,
                        outlined = not (null (!outlined)), finals = finals,
                        join = fn () =>
                          (await_preload ();

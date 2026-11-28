@@ -83,6 +83,11 @@ Theorem c_thm:
 Proof
   rw[a_value_def] (* c_thm *)
 QED
+
+val _ =
+  case OS.Process.getEnv "HOLBUILD_TOOL_CACHE_DIR" of
+      NONE => ()
+    | SOME dir => TextIO.closeOut (TextIO.openOut (OS.Path.concat (dir, "pause")));
 SML
 cat > "$project/src/BScript.sml" <<'SML'
 Theory B
@@ -505,22 +510,14 @@ cmp "$tmpdir/A.pmo" "$modules"
 # resumes from them.
 rm -rf "$worker_modules" "$worker/checkpoint-store" "$worker/checkpoints"
 edit_c healed
-exec_theory C c-healed
+exec_theory C c-healed shared pause
 require_grep 'restored shared' "$tmpdir/c-healed-C.log"
 resumed c-healed-C 'theorem-context checkpoint after c_first'
+tool_entry=$(grep -lx 'holbuild-tool-cache-v1' "$tmpdir"/remote/ac/*)
 
 # Tool cache lookup happens after checkpoint restore and before HOL starts.
-# Pause there to replace the module after its digest was checked. HOL must
-# still reject the restored checkpoint and rebuild successfully.
-spec_c=$(awk '$1 == "action" && $5 == "deps-modules:CTheory" { print $4 }' "$tmpdir/c.batch")
-spec_file=$project/.holbuild/action-specs/$spec_c
-# c_tool_entry NAME: the cache entry C's run reads for tool cache NAME.
-c_tool_entry() {
-  local key
-  key=$(printf 'holbuild-tool-cache-v1\nname=%s\ndeps_key=%s\ntoolchain=%s' "$1" \
-    "$(sed -n 's/^deps-key=//p' "$spec_file")" "$(sed -n 's/^toolchain=//p' "$spec_file")" | sha256sum | cut -d' ' -f1)
-  printf 'holbuild-remote-ac-v1\n%s\n' "$key" | sha256sum | cut -d' ' -f1
-}
+# Pause at the entry c-healed published to replace the module after its
+# digest was checked. HOL must still reject the checkpoint and rebuild.
 control=$tmpdir/control
 # start_paused ENTRY THEORY NAME...: exec_theory THEORY NAME... in the
 # background, paused at its first read of the cache entry ENTRY until
@@ -548,7 +545,7 @@ release_paused() {
 mkdir -p "$(dirname "$z_module")"
 cp "$tmpdir/Z.pmo" "$z_module"
 edit_c post-restore
-start_paused "$(c_tool_entry post-restore)" C post-restore shared post-restore
+start_paused "${tool_entry##*/}" C post-restore shared pause
 cp "$tmpdir/Z.pmo" "$tmpdir/replacement.pmo"
 mv "$tmpdir/replacement.pmo" "$modules"
 release_paused
@@ -764,7 +761,7 @@ fi
 cp "$c_heap_entry" "$tmpdir/C-alternate.entry"
 rm -rf "$worker/checkpoint-store" "$worker/checkpoints"
 edit_c overlap
-start_paused "$(c_tool_entry overlap)" C overlap shared overlap
+start_paused "${tool_entry##*/}" C overlap shared pause
 cp "$tmpdir/A.pmo" "$tmpdir/replacement.pmo"
 mv "$tmpdir/replacement.pmo" "$modules"
 release_paused
