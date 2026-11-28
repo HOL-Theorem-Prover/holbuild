@@ -144,6 +144,7 @@ val CURLOPT_HEADERDATA = 10029
 val CURLOPT_WRITEFUNCTION = 20011
 val CURLOPT_POSTFIELDSIZE_LARGE = 30120
 val CURLOPT_COPYPOSTFIELDS = 10165
+val CURLOPT_TCP_KEEPALIVE = 213
 val CURLINFO_RESPONSE_CODE = 0x200002
 val CURLMOPT_MAXCONNECTS = 6
 val CURLE_PEER_FAILED_VERIFICATION = 60
@@ -728,7 +729,8 @@ fun run_streaming easy key pending on_data =
     end)
 
 (* Sends one request as the curl command does by default, the way the
-   remote-exec client used to through it: no redirects followed, no
+   remote-exec client used to through it: no redirects followed, TCP
+   keepalive probes after 60 s idle (libcurl's default timing), no
    Accept-Encoding, and none of the remote cache's credentials, only the
    given headers.  BODY, when given, is POSTed.  The response body goes to
    on_data on this thread as it arrives, so a stream such as an event feed is
@@ -768,6 +770,9 @@ fun stream_once {url, headers, body, connect_timeout, max_time, on_data} =
       (check "CONNECTTIMEOUT" (setopt_long (easy, CURLOPT_CONNECTTIMEOUT, connect_timeout));
        check "TIMEOUT_MS" (setopt_long (easy, CURLOPT_TIMEOUT_MS, 1000 * Option.getOpt (max_time, 0)));
        check "FOLLOWLOCATION" (setopt_long (easy, CURLOPT_FOLLOWLOCATION, 0));
+       (* The curl command's default: a stream with no timeout whose peer
+          vanished silently fails instead of waiting forever. *)
+       check "TCP_KEEPALIVE" (setopt_long (easy, CURLOPT_TCP_KEEPALIVE, 1));
        check "ACCEPT_ENCODING" (setopt_ptr (easy, CURLOPT_ACCEPT_ENCODING, Foreign.Memory.null));
        check "USERPWD" (setopt_ptr (easy, CURLOPT_USERPWD, Foreign.Memory.null));
        check "URL" (setopt_str (easy, CURLOPT_URL, url));

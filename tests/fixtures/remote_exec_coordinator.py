@@ -14,7 +14,9 @@ done all the same, as the coordinator ends a run batch whose actions failed;
 its query is in the request log.  Control files in STATE change the answers: `refuse` makes POST answer
 400, `unavailable`, holding a count, makes that many POSTs answer 502 (or the
 status `unavailable-status` holds), `restarting`, holding a count, makes that
-many event streams answer 503, `drop`
+many event streams answer 503, `rotate`, holding a curl config's path, makes the
+next of those 502s or 503s first rewrite that config to the bearer token
+`rotated-token` (and is removed), as a token replaced meanwhile, `drop`
 ends the next event stream before the final event (and is removed), `cut`
 ends it midway through its first action event (and is removed), `replay`,
 holding a count, makes that many event streams send the first action's running
@@ -60,6 +62,13 @@ state = pathlib.Path(sys.argv[2])
 run = sys.argv[3]
 
 
+def rotate_token():
+    rotate = state / "rotate"
+    if rotate.exists():
+        pathlib.Path(rotate.read_text().strip()).write_text('header = "Authorization: Bearer rotated-token"\n')
+        rotate.unlink()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -99,6 +108,7 @@ class Handler(BaseHTTPRequestHandler):
             unavailable.write_text(str(int(unavailable.read_text()) - 1))
             status_file = state / "unavailable-status"
             status = int(status_file.read_text()) if status_file.exists() else 502
+            rotate_token()
             return self.answer(status, {"detail": "restarting"})
         batch_id = f"b{len(list(state.glob('*.batch'))) + 1}"
         (state / f"{batch_id}.batch").write_text(body)
@@ -129,6 +139,7 @@ class Handler(BaseHTTPRequestHandler):
         restarting = state / "restarting"
         if restarting.exists() and int(restarting.read_text()) > 0:
             restarting.write_text(str(int(restarting.read_text()) - 1))
+            rotate_token()
             return self.answer(503, {"detail": "restarting"})
         recorded = state / f"{parts[3]}.events"
         if recorded.exists():

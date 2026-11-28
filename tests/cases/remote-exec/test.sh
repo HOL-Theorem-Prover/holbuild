@@ -3452,6 +3452,23 @@ for agent in "${agents[@]}"; do
   through "$agent" "cut-$agent"
   require_grep 'lost the event stream for batch b[0-9]*: {"type": "action", "input_key"curl: (18) .*; reattaching' "$tmpdir/cut-$agent.log"
   require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/cut-$agent.log"
+  # A token replaced while a submission backs off, or before a reattach, is
+  # the one the next request sends, as the curl command reads its config.
+  for refusal in unavailable restarting; do
+    cp "$tmpdir/transport.curl" "$tmpdir/rotate.curl"
+    : > "$state/requests.log"
+    write_theories "rotate-$refusal-$agent"
+    echo 1 > "$state/$refusal"
+    echo "$tmpdir/rotate.curl" > "$state/rotate"
+    HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/rotate.curl \
+      run "rotate-$refusal-$agent" 0 build --remote-exec "$coordinator" --remote-only BTheory
+    batch=$(sed -n 's/^holbuild: remote batch \(b[0-9]*\)$/\1/p' "$tmpdir/rotate-$refusal-$agent.log")
+    grep -E "^(POST /v1/batches |GET /v1/batches/$batch/events )" "$state/requests.log" > "$tmpdir/rotate.requests"
+    [[ ! -e $state/rotate && $(head -1 "$tmpdir/rotate.requests") == *" Bearer stub-token" &&
+       $(tail -1 "$tmpdir/rotate.requests") == *" Bearer rotated-token" ]] ||
+      { cat "$tmpdir/rotate.requests" >&2; exit 1; }
+    rm "$state/$refusal"
+  done
 done
 [[ -n $forced ]] || unset HOLBUILD_TEST_LIBCURL
 : > "$state/agents.log"
