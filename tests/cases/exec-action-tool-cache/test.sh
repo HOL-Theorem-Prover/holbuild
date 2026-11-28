@@ -13,7 +13,9 @@ source "$SCRIPT_DIR/../../lib.sh"
 
 tmpdir=$(make_temp_dir)
 server_pid=""
+ahead_pid=""
 cleanup() {
+  if [[ -n "$ahead_pid" ]]; then wait "$ahead_pid" 2>/dev/null || true; fi
   if [[ -n "$server_pid" ]]; then
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
@@ -81,7 +83,7 @@ SML
 
 field() { awk -v want="$2" -v col="$3" '$1 == "action" && $5 == want { print $col }' "$1"; }
 
-# worker NAME SPEC [HOST]: mount a fresh worker cache, or the cache saved
+# worker NAME SPEC [HOST [OPTION...]]: mount a fresh worker cache, or the cache saved
 # for HOST, at the same path. Fleet workers have separate stores and the
 # same action-root path. Save the result and HOL log under NAME.
 worker() {
@@ -90,7 +92,7 @@ worker() {
   link_hol_toolchain_cache "$cache"
   set +e
   HOLBUILD_CACHE=$cache "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" \
-    --cache-limit-gb 1000 --result "$tmpdir/$name.result" > "$tmpdir/$name.log" 2>&1
+    --cache-limit-gb 1000 --result "$tmpdir/$name.result" "${@:4}" > "$tmpdir/$name.log" 2>&1
   worker_status=$?
   set -e
   mv "$cache" "$saved"
@@ -181,14 +183,33 @@ worker v2 "$spec_t"
 expect v2 0 v1
 require_grep "restored tool cache (1 files)" "$tmpdir/v2.log"
 
-# A comment inside the ancestor's proof changes its action key but keeps T's
-# tool cache. T's new theorem makes it run instead of taking early cutoff.
+# A comment inside A's proof changes its action key but keeps T's tool cache.
+# Hold A's newly built entry until T is loading ahead. T's first script-time
+# read must see the file after the late parent arrives and before it runs.
 sed -i 's/^  simp\[\]$/  simp[] (* proof comment *)/' "$project/src/AScript.sml"
 write_t proof_edit ''
 export_t proof-edit --tool-cache probe
 [[ -f "$tmpdir/a-proof-edit.result" ]] || { echo "A did not rebuild after the proof edit" >&2; exit 1; }
-worker proof-edit "$spec_t"
-expect proof-edit 0 v2
+edited_a_key=$(field "$tmpdir/batch-proof-edit.txt" tools:ATheory 2)
+edited_a_spec=$(field "$tmpdir/batch-proof-edit.txt" tools:ATheory 4)
+edited_a_ac=$(printf 'holbuild-remote-ac-v1\n%s\n' "$edited_a_key" | sha256sum | cut -d' ' -f1)
+mv "$tmpdir/remote/ac/$edited_a_ac" "$tmpdir/edited-a.entry"
+(
+  worker proof-edit "$spec_t" proof-edit --ahead-parent "$edited_a_key:$edited_a_spec" --ahead-wait-seconds 30
+  expect proof-edit 0 v2
+  require_grep '^phase-ms=.*aheadload:[0-9][0-9]*,aheadwait:[0-9]' "$tmpdir/proof-edit.result"
+) &
+ahead_pid=$!
+waiting=$tmpdir/action-worker/action/.holbuild/ahead/waiting-ATheory
+for _ in {1..300}; do
+  [[ -e "$waiting" ]] && break
+  kill -0 "$ahead_pid" 2>/dev/null || break
+  sleep 0.05
+done
+[[ -e "$waiting" ]] || { echo "T did not wait for the edited A" >&2; exit 1; }
+mv "$tmpdir/edited-a.entry" "$tmpdir/remote/ac/$edited_a_ac"
+wait "$ahead_pid"
+ahead_pid=""
 
 # A failed build's files are published too.
 write_t v3 'val _ = tool_put "seen" "v3";' 'FAIL_TAC "no proof"'

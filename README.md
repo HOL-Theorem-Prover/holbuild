@@ -2001,10 +2001,27 @@ sha256("holbuild-tool-cache-v1\nname=" ^ NAME ^ "\ndeps_key=" ^ <deps_key> ^ "\n
 and gives the theory's HOL processes that directory as
 `HOLBUILD_TOOL_CACHE_DIR`. The `<deps_key>` is the dependency context key
 used by the shared dependency heap, computed from the built dependency
-outputs and the preload order with skipped loads removed. An ancestor edit
-that leaves those unchanged keeps the same entry. The dependency context
-includes paths under the action root, so workers use the same action-root
-path to share an entry.
+outputs and the preload order with skipped loads removed.
+
+```text
+deps_output_key = sha256(lines("holbuild-remote-deps-output-v1", theory files, libraries, library manifests))
+deps_key = sha256(lines("holbuild-remote-dependency-context-v2", "toolchain=" ^ <toolchain key>,
+                        "deps-output=" ^ deps_output_key, effective dep lines))
+```
+
+Here `lines` joins the records with newlines and ends with a newline.
+The output records are `theory-file <path> <digest>` for each dependency's
+`.dat` and then each dependency's `.sig`, `.sml`, `.ui` and `.uo`, followed
+by `library <path> <sha256>` and `lib <target> <stem> <suffix> <loads...>`
+records from the spec. A `.dat`
+uses the digest from its generated theory source, or its SHA-1 if that
+digest is unavailable. The other files use SHA-256. The effective `dep=`
+lines come from the action text with input keys and skipped loads removed.
+An ancestor edit that leaves this context unchanged keeps the same entry.
+If the worker cannot compute the output context, it uses the input-based
+`deps-key` from the spec. The output context includes paths under the
+action root, so workers use the same action-root path to share an entry.
+
 The worker keeps the entry's files in its host store
 (`<cache root>/checkpoint-store`), so it fetches each from the remote cache
 once. If the remote cache has lost a file's blob, the worker restores the
