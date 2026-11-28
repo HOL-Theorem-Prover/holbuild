@@ -1645,7 +1645,7 @@ class Coordinator:
                     probe = self.probe_at.get(host_id)
                     if quarantine == "failures" and (probe is None or (now - probe).total_seconds() >= PROBE_SECONDS):
                         self.probe_at[host_id] = now
-                        claimed, _ = await self._claim(tiers, worker)
+                        claimed, _ = await self._claim(tiers, worker, disconnected=disconnected)
                         if claimed is not None:
                             self._lease_host(claimed.attempt_token, host_id, worker, tiers)
                         claimed = await self._answered(claimed, disconnected)
@@ -1689,12 +1689,20 @@ class Coordinator:
                     if read is not None and ahead_tiers and claim_tiers else None
                 )
                 claimed, held_until = (
-                    await self._claim(claim_tiers, worker, outranked, host_id, hint, hint_only, held_tiers, tiers)
+                    await self._claim(
+                        claim_tiers, worker, outranked, host_id, hint, hint_only, held_tiers, tiers, disconnected
+                    )
                     if claim_tiers else (None, None)
                 )
                 # Builds left for their holders still rank before claims ahead.
                 if claimed is None and read is not None and ahead_tiers and held_until is None:
-                    claimed = await self._claim_ahead(read, ahead_tiers, worker, kept=kept)
+                    if disconnected is not None and await disconnected():
+                        self._pass_wake(woken)
+                        return None
+                    claimed = await self._claim_ahead(read, ahead_tiers, worker, kept=kept, disconnected=disconnected)
+                    if claimed is None and disconnected is not None and await disconnected():
+                        self._pass_wake(woken)
+                        return None
                 remaining = deadline - loop.time()
                 if claimed is not None or remaining <= 0:
                     # Recorded before the answer, so the scale-in line counts a lease while it waits (as _claim
@@ -1735,20 +1743,21 @@ class Coordinator:
     ) -> Claim | None:
         """``claimed``, or None once its lease is ended when its worker has gone by now, as one ECS stopped while
         it waited does: no answer would reach it, so the action would wait out the lease. It goes back at once
-        without counting the attempt, as ``release_unheld`` ends a lease."""
+        without counting the attempt or interruption."""
         if claimed is None or disconnected is None or not await disconnected():
             return claimed
         await self.give_back(claimed)
         return None
 
     async def give_back(self, claimed: Claim) -> None:
-        """End the lease of ``claimed``, whose worker never got it, as ``release_unheld`` ends one."""
+        """End the lease of ``claimed``, whose worker never got the claim response, without charging an interruption."""
         async with self.engine.connect() as conn:
             batch_id = await conn.scalar(
                 sa.text("SELECT batch_id FROM leases WHERE attempt_token = :token"), {"token": claimed.attempt_token}
             )
         if batch_id is not None:
-            await self._end_unheld([(claimed.attempt_token, batch_id)])
+            await self._end_lease(claimed.attempt_token, batch_id, given_back=True)
+            self.request_release(batch_id)
 
     def _outranked_by_ahead(
         self, read: _AheadRead, tiers: list[str], ahead_tiers: list[str], kept: Callable[[str], bool]
@@ -1779,6 +1788,7 @@ class Coordinator:
         hint_only: frozenset[str] = frozenset(),
         held_tiers: frozenset[str] = frozenset(),
         worker_tiers: list[str] | None = None,
+        disconnected: Callable[[], Awaitable[bool]] | None = None,
     ) -> tuple[Claim | None, float | None]:
         """Lease a ready build of ``tiers`` from the shared ranking, else a run action. Before a ready build that
         ranks after an action that may be claimed ahead, claim one that ``outranked`` ranks before it: of a batch
@@ -1797,10 +1807,14 @@ class Coordinator:
         run_tiers = [t for t in tiers if t not in hint_only]
         floor = min(self.settings.run_floor, self.settings.run_slots)
         if floor > 0 and run_tiers:
+            if disconnected is not None and await disconnected():
+                return None, None
             claimed, _ = await self._claim_run(run_tiers, worker, floor)
             if claimed is not None:
                 return claimed, None
         while True:
+            if disconnected is not None and await disconnected():
+                return None, None
             row = None
             try:
                 async with self.engine.begin() as conn:
@@ -1838,7 +1852,7 @@ class Coordinator:
                     ranking.running_priority += 1
                     self._cap_priorities(ranking)
                     claimed = await self._claim_ahead(
-                        outranked.read, above, worker, kept=outranked.kept, above=-priority
+                        outranked.read, above, worker, kept=outranked.kept, above=-priority, disconnected=disconnected
                     )
                     if claimed is not None:
                         return claimed, None
@@ -1859,7 +1873,8 @@ class Coordinator:
                             ranking.running_priority += 1
                             self._cap_priorities(ranking)
                         claimed = await self._claim_ahead_in(
-                            outranked.read, batch_id, tier, worker, kept=outranked.kept, deeper_than=ready
+                            outranked.read, batch_id, tier, worker, kept=outranked.kept, deeper_than=ready,
+                            disconnected=disconnected,
                         )
                         if claimed is not None:
                             return claimed, None
@@ -1975,7 +1990,14 @@ class Coordinator:
         )
 
     async def _claim_ahead(
-        self, read: _AheadRead, tiers: list[str], worker: str, *, kept: Callable[[str], bool], above: int | None = None
+        self,
+        read: _AheadRead,
+        tiers: list[str],
+        worker: str,
+        *,
+        kept: Callable[[str], bool],
+        above: int | None = None,
+        disconnected: Callable[[], Awaitable[bool]] | None = None,
     ) -> Claim | None:
         """Lease an action of ``tiers`` ahead of its parents: of the running batches with an ``ahead_cap``, the
         action whose chain of dependents is deepest of those whose unfinished parents all run, at most
@@ -1995,7 +2017,7 @@ class Coordinator:
             ):
                 if (batch_id, tier) in read.exhausted:
                     continue
-                claimed = await self._claim_ahead_in(read, batch_id, tier, worker, kept=kept)
+                claimed = await self._claim_ahead_in(read, batch_id, tier, worker, kept=kept, disconnected=disconnected)
                 if claimed is not None:
                     return claimed
         return None
@@ -2009,6 +2031,7 @@ class Coordinator:
         *,
         kept: Callable[[str], bool],
         deeper_than: tuple[int, int] | None = None,
+        disconnected: Callable[[], Awaitable[bool]] | None = None,
     ) -> Claim | None:
         """Lease the best action of ``tier`` of ``batch_id`` that ``read`` found may be claimed ahead, if any still
         may, or mark the batch and tier exhausted in ``read``. With ``deeper_than``, only of those with a deeper
@@ -2021,6 +2044,8 @@ class Coordinator:
         turn comes finds in ``read`` what the claims before it took, and leases nothing if the scale-in line for claims
         ahead moved past its host meanwhile (``kept``)."""
         async with self._ahead_turn(batch_id):
+            if disconnected is not None and await disconnected():
+                return None
             if (batch_id, tier) in read.exhausted or not kept(tier):
                 return None
 
@@ -3775,9 +3800,12 @@ class Coordinator:
             await self._end_lease(token, batch_id, unheld=True)
             self.request_release(batch_id)
 
-    async def _end_lease(self, token: UUID, batch_id: UUID, *, unheld: bool = False) -> None:
+    async def _end_lease(
+        self, token: UUID, batch_id: UUID, *, unheld: bool = False, given_back: bool = False
+    ) -> None:
         """End lease ``token`` of ``batch_id`` without its worker's result: one that expired, or with ``unheld`` a
-        live one its worker never got (``release_unheld``)."""
+        live one its worker never got (``release_unheld``), or with ``given_back`` one whose claim response was never
+        sent."""
         ahead_freed = False
         async with self.engine.begin() as conn:
             await self._lock_batch(conn, batch_id)
@@ -3787,7 +3815,7 @@ class Coordinator:
                         "DELETE FROM leases WHERE attempt_token = :token AND expires_at > now() "
                         "RETURNING input_key, worker"
                     )
-                    if unheld
+                    if unheld or given_back
                     else sa.text(
                         "DELETE FROM leases WHERE attempt_token = :token AND expires_at <= now() "
                         "RETURNING input_key, worker"
@@ -3812,7 +3840,17 @@ class Coordinator:
             ).one()
             if action.state != "running":
                 return
-            if unheld and action.interruptions < self.settings.max_interruptions:
+            if given_back:
+                await conn.execute(
+                    sa.text(
+                        "UPDATE actions SET attempts = attempts - 1 "
+                        "WHERE batch_id = :batch_id AND input_key = :input_key"
+                    ),
+                    {"batch_id": batch_id, "input_key": lease.input_key},
+                )
+                await self._retry(conn, batch_id, lease.input_key, ahead_batch=action.ahead_batch)
+                ahead_freed = action.ahead_batch
+            elif unheld and action.interruptions < self.settings.max_interruptions:
                 await conn.execute(
                     sa.text(
                         "UPDATE actions SET attempts = attempts - 1, interruptions = interruptions + 1, "

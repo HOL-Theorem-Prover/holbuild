@@ -923,6 +923,14 @@ async def test_a_claim_whose_worker_has_gone_gives_its_action_back(
         coordinator.infra_streak["host-a"] = (coordinator_module.QUARANTINE_FAILURES, None)
         coordinator.probe_at["host-a"] = coordinator.clock() - timedelta(seconds=coordinator_module.PROBE_SECONDS)
     batch_id = await submit(http, ["a"])
+    async with coordinator.engine.begin() as conn:
+        await conn.execute(
+            sa.text(
+                "UPDATE actions SET interruptions = 2, last_failure = 'memory', failure_detail = 'earlier' "
+                "WHERE batch_id = :batch_id"
+            ),
+            {"batch_id": batch_id},
+        )
 
     async def gone() -> bool:
         return True
@@ -930,7 +938,11 @@ async def test_a_claim_whose_worker_has_gone_gives_its_action_back(
     assert await coordinator.claim(["standard"], "w9", 0, gone, "host-a") is None
     await coordinator.released()
     (action,) = (await batch(http, batch_id))["actions"]
-    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
+    assert (
+        action["state"], action["attempts"], action["interruptions"], action["last_failure"], action["failure_detail"]
+    ) == (
+        "ready", 0, 2, "memory", "earlier"
+    )
     assert not coordinator.lease_hosts and not coordinator.host_keys.get("host-a")
     claimed = await coordinator.claim(["standard"], "w10")
     assert claimed is not None and claimed.theory == "pkg:a"
@@ -961,7 +973,11 @@ async def test_a_woken_claim_whose_worker_left_while_it_took_the_action_gives_it
     assert await waiting is None and left
     await coordinator.released()
     (action,) = (await batch(http, batch_id))["actions"]
-    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
+    assert (
+        action["state"], action["attempts"], action["interruptions"], action["last_failure"], action["failure_detail"]
+    ) == (
+        "ready", 0, 0, None, None
+    )
 
 
 async def test_a_claim_whose_worker_left_as_the_endpoint_answered_gives_its_action_back(
@@ -987,7 +1003,11 @@ async def test_a_claim_whose_worker_left_as_the_endpoint_answered_gives_its_acti
     assert response.status_code == 204 and left
     await coordinator.released()
     (action,) = (await batch(http, batch_id))["actions"]
-    assert (action["state"], action["attempts"], action["last_failure"]) == ("ready", 0, "unavailable")
+    assert (
+        action["state"], action["attempts"], action["interruptions"], action["last_failure"], action["failure_detail"]
+    ) == (
+        "ready", 0, 0, None, None
+    )
 
 
 async def test_a_late_claim_leaves_the_leases_its_worker_claimed_since(
@@ -2440,6 +2460,39 @@ async def test_a_waiting_claim_whose_worker_left_leases_nothing(
     batch_id = await submit(http, ["a"])
     assert await asyncio.wait_for(waiting, 10) is None
     assert await states(http, batch_id) == {"a": "ready"}
+
+
+async def test_a_disconnected_ahead_claim_after_candidates_read_leases_nothing(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a", "b"], [("b", "a")], speculative_loading="1")
+    parent = await coordinator.claim(["standard"], "parent")
+    assert parent is not None and parent.theory == "pkg:a"
+
+    async def gone() -> bool:
+        return True
+
+    assert await coordinator.claim(["standard"], "w", disconnected=gone, ahead=True) is None
+    assert await states(http, batch_id) == {"a": "running", "b": "waiting"}
+
+
+async def test_a_disconnected_claim_after_its_ahead_turn_leases_nothing(
+    http: httpx.AsyncClient, coordinator: Coordinator
+) -> None:
+    batch_id = await submit(http, ["a", "b"], [("b", "a")], speculative_loading="1")
+    parent = await coordinator.claim(["standard"], "parent")
+    assert parent is not None and parent.theory == "pkg:a"
+    read = await coordinator._ahead_candidates()
+    ahead_batch, _, tier, *_ = read.candidates[0]
+
+    async def gone() -> bool:
+        return True
+
+    assert (
+        await coordinator._claim_ahead_in(read, ahead_batch, tier, "w", kept=lambda _: True, disconnected=gone)
+        is None
+    )
+    assert await states(http, batch_id) == {"a": "running", "b": "waiting"}
 
 
 async def test_a_waiting_claim_finds_an_action_another_coordinator_process_made_ready(
