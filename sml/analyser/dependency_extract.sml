@@ -35,8 +35,19 @@ fun sort_unique items = List.foldl (fn (item, acc) => insert_sorted item acc) []
 
 fun holdep_mentions path =
   let
-    val reader = HOLSource.fileToReader {quietOpen = false, print = fn _ => ()} path
-    val mentions = Holdep_tokens.reader_deps (path, #read reader)
+    val parse_error = ref NONE
+    fun record_error msg =
+      if isSome (!parse_error) then () else parse_error := SOME msg
+    val mentions =
+      (let
+         val reader = HOLSource.fileToReader {quietOpen = false, print = record_error} path
+       in Holdep_tokens.reader_deps (path, #read reader) end)
+      (* HOL can report an unclosed literal and then throw while decoding it.
+         Keep letting dependency discovery proceed when recovery succeeds. *)
+      handle e as Subscript =>
+        raise Error (case !parse_error of
+                         SOME msg => msg
+                       | NONE => "Holdep failed for " ^ path ^ ": " ^ General.exnMessage e)
   in
     sort_unique (Binarymap.foldl (fn (name, _, acc) => name :: acc) [] mentions)
   end
