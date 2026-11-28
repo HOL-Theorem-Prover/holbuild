@@ -156,13 +156,14 @@ export_run() {
 # container would; the record goes to $tmpdir/NAME.result.
 worker() {
   local name=$1 spec=$2
+  shift 2
   local cache=$tmpdir/worker-$name
   link_hol_toolchain_cache "$cache"
   mkdir -p "$tmpdir/cwd-$name"
   set +e
   (cd "$tmpdir/cwd-$name" &&
      HOLBUILD_CACHE=$cache "$HOLBUILD_BIN" --remote-cache "$remote_url" exec-action "$spec" \
-       --cache-limit-gb 1000 --result "$tmpdir/$name.result") > "$tmpdir/$name.log" 2>&1
+       --cache-limit-gb 1000 --result "$tmpdir/$name.result" "$@") > "$tmpdir/$name.log" 2>&1
   worker_status=$?
   set -e
 }
@@ -261,8 +262,30 @@ if grep -q '^context-input-layout=' "$remote_root/cas/$hol_spec"; then
   echo 'a toolchain context changed its input layout key' >&2
   exit 1
 fi
-worker hol "$hol_spec"
+# Its script waits for machine memory, behind a lease filling the budget for
+# 5 s from when the worker starts waiting.  A script's wait is the driver's
+# time in its record (holdriver), not a HOL child's admission (holadmit).
+coop=$tmpdir/coop
+mkdir -p "$coop"
+printf '%s\n' $((2048 * 1024 * 1024)) > "$coop/lease-held"
+(flock 9; touch "$tmpdir/lease-held"
+ for _ in $(seq 1 600); do
+   grep -qs 'waiting for machine memory' "$tmpdir/hol.log" && break
+   sleep 0.1
+ done
+ sleep 5) 9< "$coop/lease-held" &
+held_pid=$!
+for _ in $(seq 1 100); do [[ -e "$tmpdir/lease-held" ]] && break; sleep 0.1; done
+require_file "$tmpdir/lease-held"
+worker hol "$hol_spec" --cooperate-dir "$coop" --machine-max-mem 2048 --child-charge 2048
+wait "$held_pid"
 expect hol 0 status=built "input-key=$hol_key"
+require_grep "waiting for machine memory" "$tmpdir/hol.log"
+if grep -qE '^phase-ms=(.*,)?holadmit:' "$tmpdir/hol.result"; then
+  echo "a run's wait for memory was reported as a HOL child's:" >&2; cat "$tmpdir/hol.result" >&2; exit 1
+fi
+grep -qE '^phase-ms=(.*,)?holdriver:([5-9][0-9]{3}|[0-9]{5,})(,|$)' "$tmpdir/hol.result" || {
+  echo "a run's wait for memory is not in its holdriver:" >&2; cat "$tmpdir/hol.result" >&2; exit 1; }
 if grep -q '^parent ' "$(ac_file "$hol_key")"; then
   echo "a toolchain context's entry has a parent" >&2
   cat "$(ac_file "$hol_key")" >&2

@@ -936,9 +936,10 @@ run unavailable-detach 1 build --remote-exec "$coordinator" --remote-only --deta
 [[ $(grep -c "coordinator refused the batch (HTTP 502)" "$tmpdir/unavailable-detach.log") -eq 5 ]] ||
   { cat "$tmpdir/unavailable-detach.log" >&2; exit 1; }
 rm "$state/unavailable"
-# The coordinator's own 500 under load, and a 429, are retried the same way;
-# another 4xx is refused at once.
-for status in 500 429; do
+# A restarting coordinator's 503, its proxy's 504, the coordinator's own 500
+# under load, and a 429, are retried the same way; another 4xx is refused at
+# once.
+for status in 503 504 500 429; do
   write_theories "overloaded-$status"
   echo 1 > "$state/unavailable"
   echo "$status" > "$state/unavailable-status"
@@ -3382,3 +3383,105 @@ holbuild: remote rxcheck:BTheory: ready
 holbuild: remote rxcheck:BTheory: held by batch holder since 2026-01-01T00:00:00+00:00
 holbuild: remote rxcheck:BTheory: held by batch holder since 2026-01-01T01:00:00+00:00
 LINES
+
+# A batch is submitted and followed through libcurl, with the curl config's
+# headers, when libcurl is loaded, and through the curl command when it
+# isn't or the config holds more than headers, or a header file (libcurl
+# names no user agent, the curl command curl/...).  Both retry a submission
+# answered 502, ride out a coordinator restart (503s, then a dropped stream),
+# and reattach a cut stream, saying the same.
+project=$tmpdir/transport
+mkdir -p "$project/src"
+cat > "$project/holproject.toml" <<TOML
+$(write_schema2_prelude)
+[project]
+name = "rxt"
+[build]
+members = ["src"]
+TOML
+# curl reads any run of spaces, = and : between an option and its value.
+printf 'header == "Authorization: Bearer stub-token"\n' > "$tmpdir/transport.curl"
+printf 'header = "Authorization: Bearer stub-token"\nconnect-timeout = 10\n' > "$tmpdir/transport-more.curl"
+printf 'Authorization: Bearer stub-token\n' > "$tmpdir/transport.headers"
+printf 'header = "@%s"\n' "$tmpdir/transport.headers" > "$tmpdir/transport-file.curl"
+# through AGENT LOG: the last run's submissions and event streams all went
+# through AGENT (libcurl or curl) with the stub's token.
+through() {
+  local agent=$1 log=$2 batch
+  batch=$(sed -n 's/^holbuild: remote batch \(b[0-9]*\)$/\1/p' "$tmpdir/$log.log")
+  grep -E "^(POST /v1/batches |GET /v1/batches/$batch/events )" "$state/agents.log" > "$tmpdir/$log.agents"
+  [[ -s "$tmpdir/$log.agents" ]] || { cat "$state/agents.log" >&2; exit 1; }
+  if [[ $agent == libcurl ]]; then
+    refute_grep " curl/" "$tmpdir/$log.agents"
+  else
+    [[ $(grep -vc " curl/" "$tmpdir/$log.agents") -eq 0 ]] || { cat "$tmpdir/$log.agents" >&2; exit 1; }
+  fi
+  [[ $(grep -Ec "^(POST /v1/batches |GET /v1/batches/$batch/events )" "$state/requests.log") -eq \
+     $(grep -Ec "^(POST /v1/batches |GET /v1/batches/$batch/events )Bearer stub-token$" "$state/requests.log") ]] ||
+    { cat "$state/requests.log" >&2; exit 1; }
+}
+# A run of the whole case forced to the curl command checks only that.
+forced=${HOLBUILD_TEST_LIBCURL:-}
+agents=(libcurl curl)
+[[ -z $forced ]] || agents=(curl)
+for agent in "${agents[@]}"; do
+  [[ $agent == libcurl ]] || export HOLBUILD_TEST_LIBCURL=${forced:-libholbuild-test-no-such-curl.so}
+  : > "$state/agents.log"
+  : > "$state/requests.log"
+  rm -f "$state/submitted-ids"
+  write_theories "restart-$agent"
+  echo 2 > "$state/unavailable"
+  echo 2 > "$state/restarting"
+  touch "$state/drop"
+  HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/transport.curl \
+    run "restart-$agent" 0 build --remote-exec "$coordinator" --remote-only BTheory
+  through "$agent" "restart-$agent"
+  [[ $(grep -c "coordinator refused the batch (HTTP 502): .*restarting.*; retrying" "$tmpdir/restart-$agent.log") -eq 2 ]] ||
+    { cat "$tmpdir/restart-$agent.log" >&2; exit 1; }
+  [[ $(wc -l < "$state/submitted-ids") -eq 3 && $(sort -u "$state/submitted-ids" | wc -l) -eq 1 ]] ||
+    { cat "$state/submitted-ids" >&2; exit 1; }
+  [[ $(grep -c "answered HTTP 503 to the event stream for batch b[0-9]*: .*restarting.*; reattaching" "$tmpdir/restart-$agent.log") -eq 2 ]] ||
+    { cat "$tmpdir/restart-$agent.log" >&2; exit 1; }
+  require_grep "lost the event stream for batch b[0-9]*; reattaching" "$tmpdir/restart-$agent.log"
+  require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/restart-$agent.log"
+  rm "$state/unavailable" "$state/restarting"
+  : > "$state/agents.log"
+  write_theories "cut-$agent"
+  touch "$state/cut"
+  HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/transport.curl \
+    run "cut-$agent" 0 build --remote-exec "$coordinator" --remote-only BTheory
+  through "$agent" "cut-$agent"
+  require_grep 'lost the event stream for batch b[0-9]*: {"type": "action", "input_key"curl: (18) .*; reattaching' "$tmpdir/cut-$agent.log"
+  require_grep "remote execution: remote workers finished 2 of 2 theories" "$tmpdir/cut-$agent.log"
+  # A token replaced while a submission backs off, or before a reattach, is
+  # the one the next request sends, as the curl command reads its config.
+  for refusal in unavailable restarting; do
+    cp "$tmpdir/transport.curl" "$tmpdir/rotate.curl"
+    : > "$state/requests.log"
+    write_theories "rotate-$refusal-$agent"
+    echo 1 > "$state/$refusal"
+    echo "$tmpdir/rotate.curl" > "$state/rotate"
+    HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/rotate.curl \
+      run "rotate-$refusal-$agent" 0 build --remote-exec "$coordinator" --remote-only BTheory
+    batch=$(sed -n 's/^holbuild: remote batch \(b[0-9]*\)$/\1/p' "$tmpdir/rotate-$refusal-$agent.log")
+    grep -E "^(POST /v1/batches |GET /v1/batches/$batch/events )" "$state/requests.log" > "$tmpdir/rotate.requests"
+    [[ ! -e $state/rotate && $(head -1 "$tmpdir/rotate.requests") == *" Bearer stub-token" &&
+       $(tail -1 "$tmpdir/rotate.requests") == *" Bearer rotated-token" ]] ||
+      { cat "$tmpdir/rotate.requests" >&2; exit 1; }
+    [[ $refusal != unavailable ||
+       $(grep '^POST /v1/batches ' "$tmpdir/rotate.requests" | sed -n 2p) == *" Bearer rotated-token" ]] ||
+      { cat "$tmpdir/rotate.requests" >&2; exit 1; }
+    rm "$state/$refusal"
+  done
+done
+[[ -n $forced ]] || unset HOLBUILD_TEST_LIBCURL
+: > "$state/agents.log"
+write_theories more-config
+HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/transport-more.curl \
+  run more-config 0 build --remote-exec "$coordinator" --remote-only BTheory
+through curl more-config
+: > "$state/agents.log"
+write_theories header-file
+HOLBUILD_REMOTE_EXEC_CURL_CONFIG=$tmpdir/transport-file.curl \
+  run header-file 0 build --remote-exec "$coordinator" --remote-only BTheory
+through curl header-file

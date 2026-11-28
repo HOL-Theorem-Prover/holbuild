@@ -96,12 +96,13 @@ fun curl_config () =
       SOME path => SOME (normalize_curl_config path)
     | NONE => !local_curl_config
 
-(* The `user` value of a curl config file, the only option holbuild's
-   libcurl client reads from it.  Follows curl's syntax: `#` comment lines,
-   `name value`, `name = value`, `name: value` and `--name value`, values in
-   double quotes with backslash escapes.  Any other option raises Error
-   naming it. *)
-fun parse_curl_config_user text =
+(* The options of a curl config file, in order, as (name, value) pairs, a
+   name without its leading `--`.  Follows curl's syntax: `#` comment lines,
+   a name and its value separated by any run of spaces, `=` and `:` (only
+   spaces after `--name`), values in double quotes with backslash escapes.
+   `--name = value` or `--name: value`, which curl reads differently (the
+   value then starts with `=` or `:`), raises Error. *)
+fun parse_curl_config text =
   let
     fun is_separator c = Char.isSpace c orelse c = #"=" orelse c = #":"
     val drop_spaces = Substring.dropl Char.isSpace
@@ -115,28 +116,37 @@ fun parse_curl_config_user text =
         | c :: rest => quoted rest (c :: acc)
     fun value s =
       let
-        val s = drop_spaces s
-        val s = drop_spaces (if Substring.isPrefix "=" s orelse Substring.isPrefix ":" s
-                             then Substring.triml 1 s else s)
+        val s = Substring.dropl is_separator s
       in
         case Substring.getc s of
             SOME (#"\"", rest) => quoted (Substring.explode rest) []
           | _ => Substring.string (Substring.takel (not o Char.isSpace) s)
       end
-    fun option (line, user) =
+    fun option line =
       let
         val s = drop_spaces (Substring.full line)
         val (name, rest) = Substring.splitl (not o is_separator) s
         val name = Substring.string name
-        val bare = if String.isPrefix "--" name then String.extract (name, 2, NONE) else name
+        val dashed = String.isPrefix "--" name
+        val after = drop_spaces rest
       in
-        if Substring.isEmpty s orelse Substring.isPrefix "#" s then user
-        else if bare = "user" then SOME (value rest)
-        else raise Error ("unsupported option " ^ name ^ " (holbuild's libcurl client reads only user)")
+        if Substring.isEmpty s orelse Substring.isPrefix "#" s then NONE
+        else if dashed andalso (Substring.isPrefix "=" after orelse Substring.isPrefix ":" after) then
+          raise Error ("unsupported separator after " ^ name ^ " (curl reads it as part of the value)")
+        else SOME (if dashed then String.extract (name, 2, NONE) else name, value rest)
       end
   in
-    List.foldl option NONE (String.fields (fn c => c = #"\n") text)
+    List.mapPartial option (String.fields (fn c => c = #"\n") text)
   end
+
+(* The `user` value of a curl config file, the only option holbuild's
+   libcurl client reads from it.  Any other option raises Error naming it. *)
+fun parse_curl_config_user text =
+  List.foldl
+    (fn ((name, value), user) =>
+       if name = "user" then SOME value
+       else raise Error ("unsupported option " ^ name ^ " (holbuild's libcurl client reads only user)"))
+    NONE (parse_curl_config text)
 
 fun curl_config_user () =
   case curl_config () of

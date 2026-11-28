@@ -243,7 +243,11 @@ fun user text = HolbuildRemoteCacheConfig.parse_curl_config_user text
 val _ = assert "unquoted user" (user "user = name:secret\n" = SOME "name:secret")
 val _ = assert "user with colon separator" (user "user: name:secret" = SOME "name:secret")
 val _ = assert "user with space separator" (user "  user name:secret  \n" = SOME "name:secret")
+val _ = assert "user with a run of separators" (user "user : = \"name:secret\"" = SOME "name:secret")
 val _ = assert "--user" (user "--user name:secret" = SOME "name:secret")
+val _ = assert "a dashed option followed by = is refused, as curl reads it into the value"
+               ((ignore (user "--user = name:secret"); false)
+                handle HolbuildRemoteCacheConfig.Error _ => true)
 val _ = assert "quoted user with escapes"
                (user "user = \"na me:se\\\"cr\\\\et\"\n" = SOME "na me:se\"cr\\et")
 val _ = assert "comments and blank lines"

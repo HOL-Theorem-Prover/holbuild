@@ -2228,8 +2228,9 @@ fun hol_run_file_arg stage file =
 val last_child_status : OS.Process.status option ref = ref NONE
 
 (* When the latest HOL child of run_hol_files_to_log started (ms since the
-   epoch), for its holload; NONE for a child started otherwise.  A load
-   ahead's join moves it past the child's waits for late parents. *)
+   epoch), for its holload: when its machine memory reservation was granted,
+   so a wait for memory is not HOL's; NONE for a child started otherwise.  A
+   load ahead's join moves it past the child's waits for late parents. *)
 val last_child_start : LargeInt.int option ref = ref NONE
 
 (* When that child ended, as its parent saw it; NONE until it has. *)
@@ -2239,6 +2240,12 @@ val last_child_end : LargeInt.int option ref = ref NONE
    exec-action's holdriver; NONE once a load ahead's child, started before
    the hol phase, has joined it. *)
 val hol_children_ms : LargeInt.int option ref = ref (SOME 0)
+
+(* How many of those children were admitted under machine memory
+   reservations, and the milliseconds they waited for it, which their
+   holload leaves out: exec-action's holadmit. *)
+val hol_children_admitted = ref 0
+val hol_children_admission_ms = ref (0 : LargeInt.int)
 
 (* HOL's `use` remembers a source parse error in the heap and, with
    failOnError set as `hol run` sets it, exits with failure after the next
@@ -2320,6 +2327,17 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
     val started = Time.toMilliseconds (Time.now ())
     val _ = last_child_start := SOME started
     val _ = last_child_end := NONE
+    (* The child is the only one this process admits meanwhile: a load
+       ahead's driver starts none while its child runs. *)
+    val admissions_before = !HolbuildMachineMemory.admissions
+    val admission_before = !HolbuildMachineMemory.admission_ms
+    fun start_at_admission () =
+      let val admission = !HolbuildMachineMemory.admission_ms - admission_before
+      in
+        last_child_start := Option.map (fn start => start + admission) (!last_child_start);
+        hol_children_admitted := !hol_children_admitted + !HolbuildMachineMemory.admissions - admissions_before;
+        hol_children_admission_ms := !hol_children_admission_ms + admission
+      end
     val tool_env =
       (case !tool_cache_dir of SOME dir => ["HOLBUILD_TOOL_CACHE_DIR=" ^ dir] | NONE => []) @
       (case !scratch_input_paths of
@@ -2335,10 +2353,12 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
          HolbuildToolchain.theory_run_argv tc @ ["--noconfig"] @
          hol_context_args context @ file_args)
         log
+      before start_at_admission ()
       handle HolbuildToolchain.Error msg =>
-        if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.child_completed) then
-          raise HolbuildActionSandbox.Error msg
-        else raise Error msg
+        (start_at_admission ();
+         if HolbuildActionSandbox.active () andalso not (!HolbuildActionSandbox.child_completed) then
+           raise HolbuildActionSandbox.Error msg
+         else raise Error msg)
     val _ = last_child_status := SOME status
     val ended = Time.toMilliseconds (Time.now ())
     val _ = last_child_end := SOME ended
@@ -10223,6 +10243,94 @@ fun dependency_spec_lines hash_file root plan keys token deps =
      library_files = map source_file libraries}
   end
 
+(* A spec's lines but those its source and action text decide, which
+   action_spec_assemble puts with these: TARGET is its target and source
+   lines up to the source's hash, BODY its file and output lines, OPTIONS
+   its option lines before the scratch inputs' hashes and TIMING those
+   after, FILES the files besides the source it names, whose hashes it
+   holds. *)
+type spec_parts =
+  {runtime : string, toolchain_line : string, deps_key : string, target : string list,
+   body : string list, options : string list, timing : string list, files : string list}
+
+fun action_spec_parts hash_file {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
+                      {theorem_checkpoints, forced, skip_checkpoints, pipeline, install_dependencies_first}
+                      (action : theory_action) node : spec_parts =
+  let
+    val context = #package action ^ ":" ^ #logical action
+    val token = spec_token context
+    val {sig_path, sml_path, data_path} = #outputs action
+    val input_lines =
+      map (fn {path, from} => file_line hash_file "input" (token path) from) (#inputs action)
+    val {library_lines, dep_lines, lib_lines, library_files} =
+      dependency_spec_lines hash_file root plan keys token (HolbuildBuildPlan.transitive_project_deps plan node)
+  in
+    {runtime = runtime, toolchain_line = toolchain_line,
+     deps_key = dependency_input_context_key action_toolchain_key plan keys node,
+     target = ["target " ^ token context, "source " ^ token (#package action) ^ " " ^ token (#relative_path action)],
+     body =
+       input_lines @
+       library_lines @
+       dep_lines @
+       lib_lines @
+       map (theory_load_spec_line token) (#loads action) @
+       ["output sig " ^ token sig_path,
+        "output sml " ^ token sml_path,
+        "output dat " ^ token data_path] @
+       map (fn decl => "output extra " ^ token decl) (#extra_outputs action),
+     options =
+       [bool_option "proof-steps" (proof_steps_enabled policy),
+        "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
+        bool_option "new-ir" (proof_ir_enabled policy)] @
+       (if timeout_text (heavy_tactic_timeout policy) =
+           timeout_text (heavy_budget NONE (tactic_timeout policy)) then []
+        else ["option heavy-tactic-timeout=" ^ timeout_text (heavy_tactic_timeout policy)]) @
+       (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
+       (if checkpoint_target_enabled policy then [bool_option "checkpoint-target" true] else []) @
+       (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
+       (if promotes_preload policy then [bool_option "promote-preload" true] else []) @
+       (if checks_only policy then [bool_option "check-only" true] else []) @
+       (if checkpoint_saves_enabled policy then [] else [bool_option "no-checkpoint-saves" true]) @
+       (if Real.== (checkpoint_seconds policy, default_checkpoint_seconds) then []
+        else ["option checkpoint-seconds=" ^ Real.toString (checkpoint_seconds policy)]) @
+       (if forced then [bool_option "force" true] else []) @
+       (if trace_steps policy then [bool_option "trace-steps" true] else []) @
+       (if pipeline then [bool_option "pipeline" true] else []) @
+       (if install_dependencies_first then [bool_option "install-dependencies-first" true] else []) @
+       (case !tool_cache_name of SOME name => ["option tool-cache=" ^ name] | NONE => []),
+     timing = if timing_source_loads () then [bool_option "source-load-timing" true] else [],
+     files = map #from (#inputs action) @ library_files}
+  end
+
+(* An exported theory action: its node, input key, spec and its sha256,
+   the files the spec names with their hashes, and the parts its action
+   text and spec are made of. *)
+type exported_spec =
+  {node : HolbuildBuildPlan.node, input_key : string, spec_sha256 : string, text : string,
+   blobs : (string * string) list,
+   action_parts : {head : string list, tail : string list}, spec_parts : spec_parts}
+
+(* The spec of the action with these PARTS whose source hashes to
+   SOURCE_HASH and has SOURCE_SIZE bytes, whose action text is ACTION_TEXT
+   and whose scratch inputs hash to SCRATCH_HASHES. *)
+fun action_spec_assemble ({runtime, toolchain_line, deps_key, target, body, options, timing, ...} : spec_parts)
+                         {input_key, action_text, source_hash, source_size, scratch_hashes} =
+  String.concatWith "\n"
+    ([action_spec_header,
+      "holbuild-version=" ^ HolbuildVersion.version,
+      "holbuild-runtime=" ^ runtime,
+      toolchain_line,
+      "input-key=" ^ input_key,
+      "action-text-sha256=" ^ HolbuildToolchain.hash_text action_text,
+      "deps-key=" ^ deps_key] @
+     List.take (target, length target - 1) @
+     [String.concatWith " " [List.last target, source_hash, Position.toString source_size]] @
+     body @
+     options @
+     map (fn hash => "option scratch-input=" ^ hash) scratch_hashes @
+     timing @
+     ["action-text"]) ^ "\n" ^ action_text
+
 (* The spec text and the files a worker fetches by content hash for it. *)
 (* A worker saves theorem checkpoints unless the spec says otherwise: a
    spec without the line, as older clients write, means true.  Likewise a
@@ -10236,65 +10344,16 @@ fun dependency_spec_lines hash_file root plan keys token deps =
    --check-only) and publishes no outputs.  no-checkpoint-saves=true: the
    worker restores shared checkpoints as usual but saves and publishes
    none (build --no-checkpoint-saves). *)
-fun action_spec_text hash_file {root, plan, keys, action_toolchain_key, runtime, toolchain_line} policy
-                     {theorem_checkpoints, forced, skip_checkpoints, pipeline, install_dependencies_first}
-                     (action : theory_action) node action_text =
+fun action_spec_text hash_file context policy flags (action : theory_action) node action_text =
   let
-    val context = #package action ^ ":" ^ #logical action
-    val token = spec_token context
+    val parts = action_spec_parts hash_file context policy flags action node
     val source = #source_file action
-    val {sig_path, sml_path, data_path} = #outputs action
-    val input_lines =
-      map (fn {path, from} => file_line hash_file "input" (token path) from) (#inputs action)
-    val {library_lines, dep_lines, lib_lines, library_files} =
-      dependency_spec_lines hash_file root plan keys token (HolbuildBuildPlan.transitive_project_deps plan node)
-    val lines =
-      [action_spec_header,
-       "holbuild-version=" ^ HolbuildVersion.version,
-       "holbuild-runtime=" ^ runtime,
-       toolchain_line,
-       "input-key=" ^ #input_key action,
-       "action-text-sha256=" ^ HolbuildToolchain.hash_text action_text,
-       "deps-key=" ^ dependency_input_context_key action_toolchain_key plan keys node,
-       "target " ^ token context,
-       String.concatWith " "
-         ["source", token (#package action), token (#relative_path action),
-          hash_file source, Position.toString (FS.fileSize source)]] @
-      input_lines @
-      library_lines @
-      dep_lines @
-      lib_lines @
-      map (theory_load_spec_line token) (#loads action) @
-      ["output sig " ^ token sig_path,
-       "output sml " ^ token sml_path,
-       "output dat " ^ token data_path] @
-      map (fn decl => "output extra " ^ token decl) (#extra_outputs action) @
-      [bool_option "proof-steps" (proof_steps_enabled policy),
-       "option tactic-timeout=" ^ timeout_text (tactic_timeout policy),
-       bool_option "new-ir" (proof_ir_enabled policy)] @
-      (if timeout_text (heavy_tactic_timeout policy) =
-          timeout_text (heavy_budget NONE (tactic_timeout policy)) then []
-       else ["option heavy-tactic-timeout=" ^ timeout_text (heavy_tactic_timeout policy)]) @
-      (if theorem_checkpoints then [] else [bool_option "theorem-checkpoints" false]) @
-      (if checkpoint_target_enabled policy then [bool_option "checkpoint-target" true] else []) @
-      (if skip_checkpoints then [bool_option "skip-checkpoints" true] else []) @
-      (if promotes_preload policy then [bool_option "promote-preload" true] else []) @
-      (if checks_only policy then [bool_option "check-only" true] else []) @
-      (if checkpoint_saves_enabled policy then [] else [bool_option "no-checkpoint-saves" true]) @
-      (if Real.== (checkpoint_seconds policy, default_checkpoint_seconds) then []
-       else ["option checkpoint-seconds=" ^ Real.toString (checkpoint_seconds policy)]) @
-      (if forced then [bool_option "force" true] else []) @
-      (if trace_steps policy then [bool_option "trace-steps" true] else []) @
-      (if pipeline then [bool_option "pipeline" true] else []) @
-      (if install_dependencies_first then [bool_option "install-dependencies-first" true] else []) @
-      (case !tool_cache_name of SOME name => ["option tool-cache=" ^ name] | NONE => []) @
-      map (fn file => "option scratch-input=" ^ hash_file file) (!scratch_input_files) @
-      (if timing_source_loads () then [bool_option "source-load-timing" true] else []) @
-      ["action-text"]
   in
-    {text = String.concatWith "\n" lines ^ "\n" ^ action_text,
-     files = source :: map #from (#inputs action) @ library_files @
-             !scratch_input_files}
+    {parts = parts,
+     text = action_spec_assemble parts
+              {input_key = #input_key action, action_text = action_text, source_hash = hash_file source,
+               source_size = FS.fileSize source, scratch_hashes = map hash_file (!scratch_input_files)},
+     files = source :: #files parts @ !scratch_input_files}
   end
 
 (* A theory waits for the nearest uncached theories it depends on, looking
@@ -10809,13 +10868,13 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
     fun export (node, _) =
       let
         val action = theory_action root plan keys toolchain_key "" node
-        val action_text =
-          HolbuildBuildPlan.action_text_with plan config_lines action_toolchain_key keys node
+        val {parts = action_parts, text = action_text} =
+          HolbuildBuildPlan.action_parts_with plan config_lines action_toolchain_key keys node
         val _ =
           if HolbuildToolchain.hash_text action_text = #input_key action then ()
           else raise Error ("internal error: action text of " ^ logical_name node ^ " does not hash to its input key")
         val policy = checkpoint_policy_for_node options project node
-        val {text, files} =
+        val {parts = spec_parts, text, files} =
           action_spec_text hash_file context policy
             {theorem_checkpoints = true,
              forced = force_node options project node, skip_checkpoints = #skip_checkpoints options,
@@ -10833,7 +10892,10 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
           ["action", #input_key action, HolbuildRemoteCache.remote_action_key (#input_key action),
            spec_sha256, package node ^ ":" ^ logical_name node] ::
         map (fn parent => "edge " ^ #input_key action ^ " " ^ HolbuildBuildPlan.input_key_for keys parent)
-            (uncached_parents plan uncached node)}
+            (uncached_parents plan uncached node),
+         exported = {node = node, input_key = #input_key action, spec_sha256 = spec_sha256, text = text,
+                     blobs = map (fn file => (file, hash_file file)) files,
+                     action_parts = action_parts, spec_parts = spec_parts} : exported_spec}
       end
     val exported = detail_time_phase "action_spec.export.specs" (fn () => map export uncached_actions)
     val action_lines = List.concat (map #lines exported)
@@ -10863,6 +10925,7 @@ fun export_action_specs (options : build_options) tc project plan keys toolchain
   in
     {batch = String.concatWith "\n" (action_batch_header :: action_lines) ^ "\n",
      deferred = map (HolbuildBuildPlan.key o #1) deferred, record = record,
+     exported = map #exported exported,
      (* The cache entries the build may restore that aren't here, for
         start_remote_exec_prefetch. *)
      prefetch = List.mapPartial (fn (node, action) =>
@@ -13408,8 +13471,8 @@ fun merge_phases phases =
    the lines; a value that isn't a nonnegative integer is dropped.  Each
    line in which HOL says it refused a theory's module counts one
    holmodrefusedn.  holload runs from CHILD_START, when the child that
-   wrote the log started, to its first runtime install (the least
-   holloadend: a runtime loaded again later prints its line first), less
+   wrote the log was admitted to start, to its first runtime install (the
+   least holloadend: a runtime loaded again later prints its line first), less
    the preload's save (holsave in a line without holloadend); without a
    runtime install, to the script's start (holscriptstart, which the stage
    prints whether or not the script is instrumented).  holscript runs from
@@ -16646,10 +16709,11 @@ fun prefetch_modules remote root tc wanted =
     handle e => warn ("theory modules not prefetched: " ^ General.exnMessage e)
 
 (* Tool caches (build --tool-cache NAME).  A theory child may keep files in
-   HOLBUILD_TOOL_CACHE_DIR that a later action with the same dependencies and
-   toolchain can reuse on any worker: the worker restores them from the
-   remote cache before the child runs, and publishes them after it, whether
-   or not the build succeeded.  The directory is flat and holds at most
+   HOLBUILD_TOOL_CACHE_DIR that a later action with the same dependency
+   outputs and toolchain can reuse on any worker. The key uses the same
+   dependency context as the shared heap. The worker restores the files
+   before the theory script runs and publishes them after it, whether or
+   not the build succeeded. The directory is flat and holds at most
    tool_cache_max_files files of tool_cache_max_bytes in all; a tool writes
    each file whole (to a temporary name, then renamed), as a failed build's
    files are published too; a link or special file there fails the
@@ -16658,9 +16722,9 @@ val tool_cache_header = "holbuild-tool-cache-v1"
 val tool_cache_max_files = 16
 val tool_cache_max_bytes = 256 * 1024 * 1024
 
-fun tool_cache_key (spec : action_spec) name =
+fun tool_cache_key (spec : action_spec) deps_key name =
   HolbuildHash.string_sha256
-    (String.concat [tool_cache_header, "\nname=", name, "\ndeps_key=", #deps_key spec,
+    (String.concat [tool_cache_header, "\nname=", name, "\ndeps_key=", deps_key,
                     "\ntoolchain=", action_text_value spec "toolchain"])
 
 fun tool_cache_failure (Error msg) = msg
@@ -17018,16 +17082,21 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     (* The hydrate's steps, after it in the report, also when it fails. *)
     fun add_hydrate_steps () = phases := !hydrate_steps @ !phases
     fun add_restore_steps () = phases := !restore_steps @ !phases
-    fun setup_tool_cache (spec : action_spec) =
+    fun prepare_tool_cache_dir name =
+      let val dir = FS.fullPath root ^ "/.holbuild/tool-cache/" ^ name
+      in
+        ensure_dir dir;
+        tool_cache_dir := SOME dir;
+        dir
+      end
+    fun setup_tool_cache (spec : action_spec) deps_key =
       case #tool_cache spec of
           NONE => NONE
         | SOME name =>
             let
-              val key = tool_cache_key spec name
-              val dir = FS.fullPath root ^ "/.holbuild/tool-cache/" ^ name
+              val key = tool_cache_key spec deps_key name
+              val dir = prepare_tool_cache_dir name
             in
-              ensure_dir dir;
-              tool_cache_dir := SOME dir;
               SOME (key, dir, phase "toolrestore" (fn () => restore_tool_cache remote (share_store cache) key dir))
             end
     (* A theory child reads each scratch input in place, the local cache's
@@ -17645,8 +17714,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                   | NONE => ())
                before drop_heap_snapshot ())
               handle e => (drop_heap_snapshot (); raise e)
-            val tool_cache =
-              (case ahead of SOME {tool_cache, ...} => tool_cache | NONE => setup_tool_cache spec)
+            (* A load-ahead child is still behind the preload barrier.
+               Restore from the final dependency context before its join
+               lets it run the theory script. *)
+            val tool_cache = setup_tool_cache spec (#deps_key action)
               handle e => (release_heap_decline (); raise e)
             val _ = (if Option.isSome ahead then () else stage_scratch_input spec)
                     handle e => (release_heap_decline (); raise e)
@@ -17818,7 +17889,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               SOME hash => hash
             | NONE => raise Error ("no hash recorded for " ^ path)
         val source_text = read_text (in_root root (action_source_path package (#path (#source spec))))
-        val tool_cache = setup_tool_cache spec
+        val _ = Option.app (ignore o prepare_tool_cache_dir) (#tool_cache spec)
         val _ = stage_scratch_input spec
         (* The stage's names don't depend on the deps context. *)
         val action = spec_theory_action root spec (cutoff_context spec NONE)
@@ -17865,6 +17936,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
              script_start_file, "holbuild-export-theory.sml"]
         val outcome : exn option option ref = ref NONE
         val started = Time.now ()
+        val admission_before = !HolbuildMachineMemory.admission_ms
         val _ = prefetch_modules remote root tc {deps = #deps spec, loads = #loads spec}
 
         val _ =
@@ -17889,7 +17961,8 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
         val waited_ms = ref (0 : LargeInt.int)
         (* aheadwait: the time the child spent in its waits, each from its
            entry (waiting-P, finishing) to its marker (or to now, for one
-           still waiting); aheadload: the rest of its preload. *)
+           still waiting); aheadload: the rest of its preload, less its wait
+           for admission, which holadmit reports. *)
         fun record_timings () =
           let
             val now = Time.now ()
@@ -17902,9 +17975,12 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                      in waited ("waiting-" ^ name, getOpt (Option.map #2 (List.find (fn (n, _) => n = name) (!arrivals)), now)) end)
                   late
             val wait = List.foldl op+ (waited ("finishing", getOpt (!released, now))) parents
+            (* The child is the only one this process admits meanwhile. *)
+            val admission = !HolbuildMachineMemory.admission_ms - admission_before
           in
             waited_ms := wait;
-            phases := ("aheadwait", wait) :: ("aheadload", LargeInt.max (0, ms (getOpt (!released, now), started) - wait)) :: !phases
+            phases := ("aheadwait", wait) ::
+                      ("aheadload", LargeInt.max (0, ms (getOpt (!released, now), started) - wait - admission)) :: !phases
           end
         val deadline = Time.+ (started, !ahead_wait_limit)
         (* Polls READY every INTERVAL while the child runs. *)
@@ -18170,7 +18246,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                run_plain spec tc false false)
             fun build_ahead pipelined =
               build spec tc false cutoff
-                (SOME {source_text = source_text, tool_cache = tool_cache,
+                (SOME {source_text = source_text,
                        outlined = not (null (!outlined)), finals = finals,
                        join = fn () =>
                          (await_preload ();
@@ -18312,7 +18388,9 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               fun count (name, n) = if !n > 0 then [(name, LargeInt.fromInt (!n))] else []
               val drops = count ("rstdropn", dropped_checkpoints) @ count ("rstmodrejn", rejected_heap_modules) @
                           count ("pubckptn", published_checkpoints)
-              val _ = phases := rev (hol_phases @ !resume_steps @ drops) @ !phases
+              val admission =
+                if !hol_children_admitted = 0 then [] else [("holadmit", !hol_children_admission_ms)]
+              val _ = phases := rev (admission @ hol_phases @ !resume_steps @ drops) @ !phases
               val merged = merge_phases (rev (!phases))
               (* The hol phases' time outside their HOL children: the
                  driver's own, around and between the children. *)

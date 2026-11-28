@@ -1380,6 +1380,7 @@ Important paths:
 .holbuild/src/<package>               # dependency source checkouts (links into git/checkouts)
 .holbuild/packages/<package>          # package build artefacts
 .holbuild/plan/<fingerprint>          # plan records
+.holbuild/resubmit/<fingerprint>      # re-submit records
 $HOLBUILD_CACHE/hol-toolchains/       # built HOL toolchains and analysers
 $HOLBUILD_CACHE/git/checkouts/        # read-only dependency source checkouts
 $HOLBUILD_CACHE/analysis/             # sources' dependency analyses
@@ -1412,9 +1413,10 @@ directory the tool may read and write. NAME is letters, digits, `.`, `_` and
 every build that names it and never cleaned by holbuild. A theory built on a
 remote worker (`--remote-exec`) gets a directory filled from the remote cache
 and saved back to it after the build, keyed by the theory's dependencies and
-toolchain (see "Running one theory action as a remote worker"). The flag
-doesn't change a theory's cache key: a theory built or cached without it is
-reused as is.
+toolchain. Edits that leave the dependency outputs and load context unchanged
+keep the same entry (see "Running one theory action as a remote worker").
+The flag doesn't change a theory's cache key: a theory built or cached
+without it is reused as is.
 
 ### Giving a tool a file it reads
 
@@ -1987,8 +1989,8 @@ publishing, the action fails as `unavailable` rather than reading that as a
 miss or a conflict: the cache failed, not the action.
 
 A theory exported with `--tool-cache NAME` (see "Keeping a tool's files
-between builds" below) gets a tool cache: before HOL starts, the worker
-fills `.holbuild/tool-cache/NAME` under the action root from the remote
+between builds" above) gets a tool cache. Before the theory script runs, the
+worker fills `.holbuild/tool-cache/NAME` under the action root from the remote
 cache's entry for the key, read with `Cache-Control: no-cache` (a cache in
 front of the store, such as a host's, may serve an entry another host's
 publish has replaced since)
@@ -1998,9 +2000,30 @@ sha256("holbuild-tool-cache-v1\nname=" ^ NAME ^ "\ndeps_key=" ^ <deps_key> ^ "\n
 ```
 
 and gives the theory's HOL processes that directory as
-`HOLBUILD_TOOL_CACHE_DIR`. The key leaves out the theory's own source, so
-every theory with the same dependencies and toolchain shares the entry, on
-any worker. The worker keeps the entry's files in its host store
+`HOLBUILD_TOOL_CACHE_DIR`. The `<deps_key>` is the dependency context key
+used by the shared dependency heap, computed from the built dependency
+outputs and the preload order with skipped loads removed.
+
+```text
+deps_output_key = sha256(lines("holbuild-remote-deps-output-v1", theory files, libraries, library manifests))
+deps_key = sha256(lines("holbuild-remote-dependency-context-v2", "toolchain=" ^ <toolchain key>,
+                        "deps-output=" ^ deps_output_key, effective dep lines))
+```
+
+Here `lines` joins the records with newlines and ends with a newline.
+The output records are `theory-file <path> <digest>` for each dependency's
+`.dat` and then each dependency's `.sig`, `.sml`, `.ui` and `.uo`, followed
+by `library <path> <sha256>` and `lib <target> <stem> <suffix> <loads...>`
+records from the spec. A `.dat`
+uses the digest from its generated theory source, or its SHA-1 if that
+digest is unavailable. The other files use SHA-256. The effective `dep=`
+lines come from the action text with input keys and skipped loads removed.
+An ancestor edit that leaves this context unchanged keeps the same entry.
+If the worker cannot compute the output context, it uses the input-based
+`deps-key` from the spec. The output context includes paths under the
+action root, so workers use the same action-root path to share an entry.
+
+The worker keeps the entry's files in its host store
 (`<cache root>/checkpoint-store`), so it fetches each from the remote cache
 once. If the remote cache has lost a file's blob, the worker restores the
 files whose blobs are left and warns for each lost one. After HOL exits, built or failed, the
@@ -2148,6 +2171,9 @@ checkpoints), `toolrestore` (the tool cache), `scratch` (staging the
 0 when the worker's cache held each), `hol`, `publish` (shared
 checkpoints), `toolpublish` (the tool cache), `check` (the publication
 checks) and `log`; stderr ends with the same times and `wall`.
+Under `--cooperate-dir`, `holadmit` is the time the theory's HOL children
+waited for their machine memory reservations, which their start-up time
+(`holload`, and a load ahead's `aheadload`) leaves out.
 `peak-rss-mb` is the HOL process's peak resident memory, reported once the
 theory has been exported.
 `log` is the build log, or the run's HOL output, uploaded to `/cas/`. `memory` means Poly/ML ran out
@@ -2357,6 +2383,30 @@ Untimed failure payloads are retained too, deduplicated by their failure fields
 without assigning an execution identity.
 These diagnostic snapshots do not participate in build or cache keys.
 
+A `--remote-exec` build of one named theory also keeps a re-submit record in
+`.holbuild/resubmit/` after a batch that held that theory alone: the stats
+and hashes of the files and directories its plan read, the script's
+dependency facts, and the parts of its action that the script's text doesn't
+decide. The next such build first computes from the record alone the action
+it would send, checking the record's files and directories with `stat` as the
+plan record does, hashing the script, and analysing it again when its hash
+moved. This fast path runs in shadow mode: the full path still plans, sends
+and decides every build, and the summary's `resubmit_shadow` says how the
+two compared. `state` is `declined` with a `reason` when the fast path
+couldn't take the build (no record, a changed toolchain, action toolchain
+key, runtime, command line or scratch inputs, a changed file, directory or
+file mode, changed dependency facts, a batch that came back for missing inputs, or an edit that
+landed while the build ran), and `compared` otherwise; a full path that
+sent no action, or one other than the fast path's, is an `action_bytes`
+mismatch. `fields` gives
+`match` or `mismatch` for `action_bytes` (the action's input key, spec and
+blobs), `verdict`, `diagnostics`, `exit_status` and `json_events`, counted in
+`matches` and `mismatches`, with `detail` saying what differed, and
+`fast_ms` is the fast path's time. Both paths share one batch, so the fast
+path's verdict and exit status are the batch's answer for its action, and
+its diagnostics and events are the build's own: those can differ from the
+full path's only when the script changed while the build ran.
+
 Supervisors can set `HOLBUILD_COMMAND_RECORD` to a destination file and
 `HOLBUILD_COMMAND_RECORD_PID` to the process ID which will exec holbuild.
 The PID check keeps inherited settings from overwriting a parent's record.
@@ -2377,6 +2427,10 @@ the build restores those theories from the local cache, or from the remote cache
 whatever is not there yet. The coordinator's credentials go
 in a curl config file named by `HOLBUILD_REMOTE_EXEC_CURL_CONFIG`, such as
 `header = "Authorization: Bearer <token>"`, so they stay off the command line.
+holbuild submits and follows the batch through libcurl when it talks to the
+remote cache through libcurl (above); otherwise, or when this file holds
+anything but `header` lines or names a header file (`header = "@path"`), it
+runs the `curl` command instead, which reads the whole file.
 
 If a local cache entry has a weaker tactic-timeout contract than requested,
 restore refreshes it from the remote cache once. This picks up a stronger

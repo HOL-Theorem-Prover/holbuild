@@ -491,7 +491,7 @@ val execution_env_prefixes =
    "HOLBUILD_REMOTE_CACHE_ALLOWED_URLS=", "HOLBUILD_REMOTE_CACHE_DISCOVERY_URL=",
    "HOLBUILD_REMOTE_CACHE_DISCOVERY_CURL_CONFIG=", "HOLBUILD_REMOTE_EXEC_CURL_CONFIG=",
    "HOLBUILD_COOPERATE_DIR=", "HOLBUILD_COOPERATE_LOCK_TIMEOUT=", "HOLBUILD_AUTO_GC=",
-   "HOLBUILD_STATUS=", "HOLBUILD_CACHE_TRACE=", "HOLBUILD_ECHO_CHILD_LOGS="]
+   "HOLBUILD_STATUS=", "HOLBUILD_CACHE_TRACE=", "HOLBUILD_ECHO_CHILD_LOGS=", "HOLBUILD_TEST_RESUBMIT_"]
 
 fun recorded_env_var entry =
   String.isPrefix "HOLBUILD_" entry andalso
@@ -596,6 +596,24 @@ fun records_newest_first dir =
     map #2 (HolbuildBuildPlan.sort_pairs (fn ((a, _), (b, _)) => Time.compare(b, a)) dated)
   end
   handle OS.SysErr _ => []
+
+(* Why the ENTRIES of the directory PATH, whose own stat held, no longer
+   hold: a change of mode moves only the entry's own stat, which a record
+   keeps only for the files it holds (KEPT). *)
+fun mode_change kept (path, entries) =
+  let
+    fun changed entry =
+      let val entry_path = SI.join path (SI.entry_name entry)
+      in
+        if SI.unreadable_entry entry then
+          if SI.is_readable entry_path then SOME ("an unreadable entry became readable in " ^ path) else NONE
+        else if String.isPrefix "f" entry andalso not (kept entry_path) andalso not (SI.is_readable entry_path)
+        then SOME ("a source became unreadable in " ^ path)
+        else NONE
+      end
+  in
+    List.foldl (fn (entry, NONE) => changed entry | (_, found) => found) NONE entries
+  end
 
 fun prune_records dir =
   let
@@ -760,16 +778,18 @@ fun not_written (Unencodable text) = NotWritten ("a path or name holds a control
 (* The write of the record of PLAN and its KEYS into DIR, which says why
    not if it can't; PRIOR is the record PLAN was restored from.  The record
    is built now, so the stamps of the files planning hashed are taken now:
-   a stamp taken later could pair a replaced file with the old hash. *)
-fun writer dir context prior plan keys : unit -> write_outcome =
+   a stamp taken later could pair a replaced file with the old hash.  With
+   the write, the record, if it could be built. *)
+fun writer dir context prior plan keys : t option * (unit -> write_outcome) =
   let val record = build context prior plan keys
   in
-    fn () => (write_record (OS.Path.concat (dir, #fingerprint record)) (encode record);
-              prune_records dir;
-              Written)
-             handle e => not_written e
+    (SOME record,
+     fn () => (write_record (OS.Path.concat (dir, #fingerprint record)) (encode record);
+               prune_records dir;
+               Written)
+              handle e => not_written e)
   end
-  handle e => let val outcome = not_written e in fn () => outcome end
+  handle e => let val outcome = not_written e in (NONE, fn () => outcome) end
 
 (* ---- Reading ---- *)
 
@@ -883,23 +903,9 @@ fun restore_record {graph, tc : HolbuildToolchain.t, fingerprint, start_ns} text
                                                    handle _ => fall ("cannot read " ^ path)))))
         (Binarymap.mkDict String.compare) (#files record)
     fun hash_of path = Binarymap.peek(hashes, path)
-    (* A change of mode moves only the entry's own stat, which the record
-       keeps for selected sources alone. *)
     val _ =
       List.app
-        (fn (path, entries) =>
-           List.app
-             (fn entry =>
-                 let val entry_path = SI.join path (SI.entry_name entry)
-                 in
-                   if SI.unreadable_entry entry then
-                     (if SI.is_readable entry_path then fall ("an unreadable entry became readable in " ^ path) else ())
-                   else if String.isPrefix "f" entry andalso not (Option.isSome (hash_of entry_path)) andalso
-                           not (SI.is_readable entry_path)
-                   then fall ("a source became unreadable in " ^ path)
-                   else ()
-                 end)
-             entries)
+        (fn dir => case mode_change (Option.isSome o hash_of) dir of SOME reason => fall reason | NONE => ())
         held_dirs
     (* Extra-input directories that moved are expanded again. *)
     val moved_input_dirs =

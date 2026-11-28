@@ -391,10 +391,17 @@ fun json_failure_field_for_node key message =
 
 fun json_fields fields = "{" ^ String.concatWith "," fields ^ "}\n"
 
+(* Sees each JSON event line as it is written. *)
+val json_event = ref (fn (_ : string) => ())
+
 fun emit_json event fields =
   (Mutex.lock json_mutex;
-   (HolbuildBoundedOutput.text (TextIO.stdOut, json_fields (json_string_field "event" event :: fields));
-    TextIO.flushOut TextIO.stdOut)
+   (let val line = json_fields (json_string_field "event" event :: fields)
+    in
+      !json_event line;
+      HolbuildBoundedOutput.text (TextIO.stdOut, line);
+      TextIO.flushOut TextIO.stdOut
+    end)
    before Mutex.unlock json_mutex)
   handle e => (Mutex.unlock json_mutex; raise e)
 

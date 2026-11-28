@@ -533,13 +533,22 @@ fun acquire {dir, budget_mb, charge_mb} =
     loop false
   end
 
+(* How many children this process has had admitted, and the milliseconds
+   it spent getting them admitted, waits included. *)
+val admissions = ref 0
+val admission_ms = ref (0 : LargeInt.int)
+
 (* Runs launch with a reserved lease descriptor that the child must inherit,
    or with NONE when cooperation is off. *)
 fun with_reservation launch =
   case !settings of
       NONE => launch NONE
     | SOME s =>
-        let val lease = acquire s
+        let
+          val start = Time.now ()
+          val lease = acquire s
+          val _ = admissions := !admissions + 1
+          val _ = admission_ms := !admission_ms + LargeInt.max (0, Time.toMilliseconds (Time.- (Time.now (), start)))
         in
           (launch (SOME (#fd lease)) before release lease)
           handle e => (release lease; raise e)
