@@ -220,9 +220,20 @@ cat > "$project/src/CScript.sml" <<'SML'
 Theory C
 Ancestors bool
 SML
+# Past the racy window, so the next record holds src's stat, not its listing.
+sleep 2
 write_b 14
 check new-file 0
 shadow new-file state=declined "reason=files added, removed or renamed in $project/src"
+# A change of mode leaves the directory's stat alone.
+chmod 000 "$project/src/CScript.sml"
+write_b 14u
+check unreadable 0
+shadow unreadable state=declined "reason=a source became unreadable in $project/src"
+chmod 644 "$project/src/CScript.sml"
+write_b 14r
+check readable 0
+shadow readable state=declined "reason=an unreadable entry became readable in $project/src"
 write_b 15 'A bool'
 check deps 0
 shadow deps state=declined "reason=the script's dependency facts changed"

@@ -2369,8 +2369,8 @@ moved. This fast path runs in shadow mode: the full path still plans, sends
 and decides every build, and the summary's `resubmit_shadow` says how the
 two compared. `state` is `declined` with a `reason` when the fast path
 couldn't take the build (no record, a changed toolchain, action toolchain
-key, runtime or command line, a changed file or directory, changed
-dependency facts, a batch that came back for missing inputs, or an edit that
+key, runtime, command line or scratch inputs, a changed file, directory or
+file mode, changed dependency facts, a batch that came back for missing inputs, or an edit that
 landed while the build ran), and `compared` otherwise; a full path that
 sent no action, or one other than the fast path's, is an `action_bytes`
 mismatch. `fields` gives

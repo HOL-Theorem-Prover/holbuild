@@ -51,13 +51,18 @@ type record =
    blobs : (string * string) list}
 
 (* What, besides the plan record's inputs, decides the action and its spec:
-   holbuild itself, the execution options (the command line, and source-load
-   timing, which the plan record's fingerprint leaves out), the runtime the
-   worker loads and the toolchain the action keys on. *)
+   holbuild itself, the execution options (the command line, source-load
+   timing, which the plan record's fingerprint leaves out, and the scratch
+   inputs), the runtime the worker loads and the toolchain the action keys
+   on. *)
 fun identity {runtime, action_toolchain_key} =
   ["version=" ^ HolbuildVersion.version,
-   "argv=" ^ String.concatWith "\003" (CommandLine.arguments ()),
+   (* A digest: the command line may name credentials, as in a remote
+      cache URL's userinfo. *)
+   "argv=" ^ HolbuildHash.string_sha256 (String.concatWith "\003" (CommandLine.arguments ())),
    "source-load-timing=" ^ Bool.toString (BE.timing_source_loads ()),
+   (* As resolved this run: one argument may name another file each time. *)
+   "scratch-inputs=" ^ String.concatWith "\003" (!BE.scratch_input_files),
    "runtime=" ^ runtime,
    "action-toolchain=" ^ action_toolchain_key]
 
@@ -168,7 +173,8 @@ fun write project (plan_record : PR.t) {runtime, action_toolchain_key}
        script = {path = path, cache_path = BP.dependency_cache_path source, deps = deps},
        action = action_parts, spec = spec_parts, scratch = scratch, blobs = kept}
   in
-    PR.write_record (OS.Path.concat (record_dir project, #fingerprint plan_record)) (encode record)
+    PR.write_record (OS.Path.concat (record_dir project, #fingerprint plan_record)) (encode record);
+    PR.prune_records (record_dir project)
   end
 
 (* ---- The fast path ---- *)
@@ -210,24 +216,34 @@ fun attempt {project, graph, tc : HolbuildToolchain.t, fingerprint} =
            if now = recorded then ()
            else if String.isPrefix "action-toolchain=" now then decline "the action toolchain key changed"
            else if String.isPrefix "runtime=" now then decline "the runtime identity changed"
-           else if String.isPrefix "argv=" now orelse String.isPrefix "source-load-timing=" now
+           else if List.exists (fn prefix => String.isPrefix prefix now)
+                               ["argv=", "source-load-timing=", "scratch-inputs="]
            then decline "the execution options changed"
            else decline "holbuild changed")
         (identity {runtime = runtime, action_toolchain_key = action_toolchain_key}, #identity record)
       handle ListPair.UnequalLengths => decline "malformed re-submit record: identity"
     val _ = if PR.member_kinds graph = #members record then ()
             else decline "a package member appeared or vanished"
-    val _ =
-      List.app
+    (* The directories whose stat held, whose entries' modes are checked
+       as the plan record's are. *)
+    val held =
+      List.mapPartial
         (fn {path, stamp = recorded, racy, entries} =>
            case PR.stamp path of
                NONE => decline ("directory vanished: " ^ path)
              | SOME st =>
-                 if not racy andalso same_stamp (st, recorded) then ()
+                 if not racy andalso same_stamp (st, recorded) then SOME (path, entries)
                  else if (SI.observed_entries path handle SI.Error _ => decline ("cannot list " ^ path)) = entries
-                 then ()
+                 then NONE
                  else decline ("files added, removed or renamed in " ^ path))
         (#dirs record)
+    val _ =
+      List.app
+        (fn dir =>
+           case PR.mode_change (fn path => List.exists (fn {path = kept, ...} => kept = path) (#files record)) dir of
+               SOME reason => decline reason
+             | NONE => ())
+        held
     val _ =
       List.app
         (fn {path, stamp = recorded, racy} =>

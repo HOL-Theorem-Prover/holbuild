@@ -597,6 +597,24 @@ fun records_newest_first dir =
   end
   handle OS.SysErr _ => []
 
+(* Why the ENTRIES of the directory PATH, whose own stat held, no longer
+   hold: a change of mode moves only the entry's own stat, which a record
+   keeps only for the files it holds (KEPT). *)
+fun mode_change kept (path, entries) =
+  let
+    fun changed entry =
+      let val entry_path = SI.join path (SI.entry_name entry)
+      in
+        if SI.unreadable_entry entry then
+          if SI.is_readable entry_path then SOME ("an unreadable entry became readable in " ^ path) else NONE
+        else if String.isPrefix "f" entry andalso not (kept entry_path) andalso not (SI.is_readable entry_path)
+        then SOME ("a source became unreadable in " ^ path)
+        else NONE
+      end
+  in
+    List.foldl (fn (entry, NONE) => changed entry | (_, found) => found) NONE entries
+  end
+
 fun prune_records dir =
   let
     fun drop (n, entries) = if n <= 0 then entries else case entries of [] => [] | _ :: rest => drop (n - 1, rest)
@@ -885,23 +903,9 @@ fun restore_record {graph, tc : HolbuildToolchain.t, fingerprint, start_ns} text
                                                    handle _ => fall ("cannot read " ^ path)))))
         (Binarymap.mkDict String.compare) (#files record)
     fun hash_of path = Binarymap.peek(hashes, path)
-    (* A change of mode moves only the entry's own stat, which the record
-       keeps for selected sources alone. *)
     val _ =
       List.app
-        (fn (path, entries) =>
-           List.app
-             (fn entry =>
-                 let val entry_path = SI.join path (SI.entry_name entry)
-                 in
-                   if SI.unreadable_entry entry then
-                     (if SI.is_readable entry_path then fall ("an unreadable entry became readable in " ^ path) else ())
-                   else if String.isPrefix "f" entry andalso not (Option.isSome (hash_of entry_path)) andalso
-                           not (SI.is_readable entry_path)
-                   then fall ("a source became unreadable in " ^ path)
-                   else ()
-                 end)
-             entries)
+        (fn dir => case mode_change (Option.isSome o hash_of) dir of SOME reason => fall reason | NONE => ())
         held_dirs
     (* Extra-input directories that moved are expanded again. *)
     val moved_input_dirs =
