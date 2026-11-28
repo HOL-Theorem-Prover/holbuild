@@ -127,9 +127,18 @@ fun fmt_ms t = Real.fmt (StringCvt.FIX (SOME 3)) (1000.0 * t)
    "holbuild hol-phases" line.  A resumed script that goes on past the
    resumed theorem loads the runtime again, and that copy prints its own
    line; exec-action sums the lines.  Names are phase names of a result
-   record: lowercase letters only. *)
+   record: lowercase letters only.
+   The time from install to exit outside the top-level parts is the
+   script's own code between them, counted as holgap unless a mark names
+   it (end_gap); the line also gives, as marks, when the last top-level
+   part ended (holpartend) and when the exit began (holexitmark), from which
+   exec-action times the rest (hol_log_phases). *)
 val hol_phases_ref = ref ([] : (string * LargeInt.int) list)
 val hol_phase_nested_ms_ref = ref (0 : LargeInt.int)
+(* When the latest top-level part ended, or else the install, in ms since
+   the epoch, and how many parts are running now. *)
+val hol_part_end_ref = ref (0 : LargeInt.int)
+val hol_part_depth_ref = ref 0
 
 fun add_hol_phase name n =
   hol_phases_ref :=
@@ -137,26 +146,45 @@ fun add_hol_phase name n =
          SOME (_, earlier) => (name, earlier + n) :: List.filter (fn (m, _) => m <> name) (!hol_phases_ref)
        | NONE => (name, n) :: !hol_phases_ref)
 
+(* Counts the time since the last top-level part, or the install, as part
+   NAME, outside any part; inside one it is that part's. *)
+fun gap_until name now =
+  if !hol_part_depth_ref > 0 then ()
+  else
+    (add_hol_phase name (LargeInt.max (0, Time.toMilliseconds now - !hol_part_end_ref));
+     hol_part_end_ref := Time.toMilliseconds now)
+
+fun end_gap name = gap_until name (Time.now ())
+
 fun timed_hol_phase name f =
   let
     val outer_nested = !hol_phase_nested_ms_ref
     val _ = hol_phase_nested_ms_ref := 0
     val t0 = Time.now ()
+    val _ = gap_until "holgap" t0
+    val _ = hol_part_depth_ref := !hol_part_depth_ref + 1
     fun record () =
       (* The wall clock can step back: a part never takes less than 0 ms. *)
-      let val elapsed = LargeInt.max (0, Time.toMilliseconds (Time.-(Time.now (), t0)))
+      let
+        val now = Time.now ()
+        val elapsed = LargeInt.max (0, Time.toMilliseconds (Time.-(now, t0)))
       in
         add_hol_phase name (LargeInt.max (0, elapsed - !hol_phase_nested_ms_ref));
-        hol_phase_nested_ms_ref := outer_nested + elapsed
+        hol_phase_nested_ms_ref := outer_nested + elapsed;
+        hol_part_depth_ref := !hol_part_depth_ref - 1;
+        if !hol_part_depth_ref = 0 then hol_part_end_ref := Time.toMilliseconds now else ()
       end
   in
     (f () before record ()) handle e => (record (); raise e)
   end
 
 fun print_hol_phases () =
-  HolbuildBoundedOutput.text (TextIO.stdErr,
-    String.concat ("holbuild hol-phases" ::
-                   map (fn (name, n) => " " ^ name ^ "=" ^ LargeInt.toString n) (rev (!hol_phases_ref))) ^ "\n")
+  let val marks = [("holpartend", !hol_part_end_ref), ("holexitmark", Time.toMilliseconds (Time.now ()))]
+  in
+    HolbuildBoundedOutput.text (TextIO.stdErr,
+      String.concat ("holbuild hol-phases" ::
+                     map (fn (name, n) => " " ^ name ^ "=" ^ LargeInt.toString n) (rev (!hol_phases_ref) @ marks)) ^ "\n")
+  end
 
 fun write_timeout_marker label seconds =
   case !tactic_timeout_marker_ref of
@@ -2496,7 +2524,7 @@ fun rewind_past_shared_leaves plan metadata =
       end
   end
 
-fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path failed_prefix_ok =
+fun resume_failed_prefix name metadata_text tactic_text failed_prefix_path failed_prefix_ok =
   let
     val old_resume_active = !failed_prefix_resume_active_ref
     val old_resumed_step_count = !failed_prefix_resumed_step_count_ref
@@ -2574,6 +2602,14 @@ fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path faile
     result
   end
 
+(* The resumed theorem's call: the gap since the last part, from the plan
+   to here, is the theorem's declaration (holreplay), and the resume's own
+   work outside its parts is holresume. *)
+fun finish_failed_prefix name metadata_text tactic_text failed_prefix_path failed_prefix_ok =
+  (end_gap "holreplay";
+   timed_hol_phase "holresume" (fn () =>
+     resume_failed_prefix name metadata_text tactic_text failed_prefix_path failed_prefix_ok))
+
 fun prove_outer_theorem ctxt (g, tac) (_, name, tactic_text, _, _, _, _, _, _) =
   let
     val atomic = tactic_text = ""
@@ -2606,6 +2642,8 @@ fun install ({checkpoint_enabled, context_checkpoints, share_failed_prefix, chec
   (install_goal_fv_printer ();
    hol_phases_ref := [("holloadend", Time.toMilliseconds (Time.now ()))];
    hol_phase_nested_ms_ref := 0;
+   hol_part_end_ref := Time.toMilliseconds (Time.now ());
+   hol_part_depth_ref := 0;
    OS.Process.atExit print_hol_phases;
    checkpoint_enabled_ref := checkpoint_enabled;
    context_checkpoints_ref := context_checkpoints;
