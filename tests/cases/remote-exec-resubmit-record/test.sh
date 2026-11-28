@@ -272,3 +272,13 @@ write_b 16 'A bool'
 check cached 0
 shadow cached state=compared matches=0 mismatches=1 fields.action_bytes=mismatch "detail~action_bytes: the full path"
 echo "PASS a full path that sends no action is counted as a mismatch"
+
+# With --json, the event streams are compared too.
+write_b 20 'A bool'
+check json-reset 0 --json
+shadow json-reset state=declined "reason=the execution options changed"
+write_b 21 'A bool'
+check json 0 --json
+shadow json state=compared matches=5 mismatches=0 "${all_fields[@]}"
+require_grep '"event"' "$tmpdir/json.log"
+echo "PASS fast path matches the full path's --json events"
