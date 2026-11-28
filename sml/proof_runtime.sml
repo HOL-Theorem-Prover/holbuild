@@ -167,7 +167,9 @@ fun timed_hol_phase name f =
       (* The wall clock can step back: a part never takes less than 0 ms. *)
       let
         val now = Time.now ()
-        val elapsed = LargeInt.max (0, Time.toMilliseconds (Time.-(now, t0)))
+        (* From the same truncated stamps as the gaps, so parts and gaps
+           tile the time. *)
+        val elapsed = LargeInt.max (0, Time.toMilliseconds now - Time.toMilliseconds t0)
       in
         add_hol_phase name (LargeInt.max (0, elapsed - !hol_phase_nested_ms_ref));
         hol_phase_nested_ms_ref := outer_nested + elapsed;

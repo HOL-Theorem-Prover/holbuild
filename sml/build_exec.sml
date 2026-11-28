@@ -2195,6 +2195,11 @@ val last_child_start : LargeInt.int option ref = ref NONE
 (* When that child ended, as its parent saw it; NONE until it has. *)
 val last_child_end : LargeInt.int option ref = ref NONE
 
+(* How long the children run_hol_files_to_log started have run in all, for
+   exec-action's holdriver; NONE once a load ahead's child, started before
+   the hol phase, has joined it. *)
+val hol_children_ms : LargeInt.int option ref = ref (SOME 0)
+
 (* HOL's `use` remembers a source parse error in the heap and, with
    failOnError set as `hol run` sets it, exits with failure after the next
    top-level declaration.  A checkpoint saved after such an error (holbuild
@@ -2272,7 +2277,8 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
     val _ = ensure_parent log
     val _ = create_current_log_link log current_log
     val _ = last_child_status := NONE
-    val _ = last_child_start := SOME (Time.toMilliseconds (Time.now ()))
+    val started = Time.toMilliseconds (Time.now ())
+    val _ = last_child_start := SOME started
     val _ = last_child_end := NONE
     val tool_env =
       (case !tool_cache_dir of SOME dir => ["HOLBUILD_TOOL_CACHE_DIR=" ^ dir] | NONE => []) @
@@ -2293,7 +2299,9 @@ fun run_hol_files_to_log tc load_context stage workdir context files log_name cu
           raise HolbuildActionSandbox.Error msg
         else raise Error msg
     val _ = last_child_status := SOME status
-    val _ = last_child_end := SOME (Time.toMilliseconds (Time.now ()))
+    val ended = Time.toMilliseconds (Time.now ())
+    val _ = last_child_end := SOME ended
+    val _ = hol_children_ms := Option.map (fn ms => ms + (ended - started)) (!hol_children_ms)
     val detail_log = finalize_current_log log current_log
   in
     if HolbuildToolchain.success status then
@@ -14029,7 +14037,7 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
               fun observe file =
                 if not (Posix.FileSys.ST.isReg (Posix.FileSys.lstat file)) then ModuleWrong
                 else
-                  case (module_file_id file, HolbuildHash.file_sha256 file = sha) of
+                  case (module_file_id file, (add_restore_step "rstmodhashn" 1; HolbuildHash.file_sha256 file = sha)) of
                       (_, false) => ModuleWrong
                     | (NONE, true) => ModuleMatches
                     | (SOME found, true) => if found = id then ModuleMatches else ModulePoisoned
@@ -14045,13 +14053,12 @@ fun restore_shared_checkpoints remote (ctx as {store, checkpoint_root, heap_key,
                 | state => state
             end
             handle OS.SysErr _ => ModuleWrong | IO.Io _ => ModuleWrong
-    (* The time hashing modules the heap loads (rstmodhash) and how many
-       (rstmodhashn). *)
+    (* The time checking the modules the heap loads (rstmodhash); each
+       file hashed counts one rstmodhashn. *)
     fun module_states modules =
       let val checks = map (fn module => (module, ref ModuleWrong)) modules
       in
         restore_step "rstmodhash" (fn () => transfer_all (fn (module, state) => state := module_state module) checks);
-        add_restore_step "rstmodhashn" (LargeInt.fromInt (length checks));
         map (fn (module, state) => (module, !state)) checks
       end
     fun in_state state checks = List.mapPartial (fn (module, s) => if s = state then SOME module else NONE) checks
@@ -18136,6 +18143,7 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                           record_timings ();
                           (* holload leaves out the waits aheadwait reports. *)
                           last_child_start := Option.map (fn start => start + !waited_ms) (!last_child_start);
+                          hol_children_ms := NONE;
                           case (abandoned (), !outcome) of
                               (SOME reason, _) => abandon reason
                             | (NONE, SOME (SOME e)) => raise e
@@ -18258,13 +18266,13 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
                           count ("pubckptn", published_checkpoints)
               val _ = phases := rev (hol_phases @ !resume_steps @ drops) @ !phases
               val merged = merge_phases (rev (!phases))
-              (* The hol phase's time outside its last HOL child: the
-                 driver's own, before the child starts and after it ends. *)
+              (* The hol phases' time outside their HOL children: the
+                 driver's own, around and between the children. *)
               val driver =
-                case (List.find (fn (name, _) => name = "hol") merged, !last_child_start, !last_child_end) of
-                    (SOME (_, hol), SOME started, SOME ended) =>
+                case (List.find (fn (name, _) => name = "hol") merged, !hol_children_ms) of
+                    (SOME (_, hol), SOME children) =>
                       if !HolbuildActionSandbox.child_completed
-                      then [("holdriver", LargeInt.max (0, hol - (ended - started)))]
+                      then [("holdriver", LargeInt.max (0, hol - children))]
                       else []
                   | _ => []
               val phases = merged @ driver @

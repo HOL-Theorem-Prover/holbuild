@@ -432,7 +432,7 @@ resumed v4a "failed-prefix checkpoint in t3" "failed_prefix checkpoint"
   echo "v4a did not revalidate the failed-prefix manifest" >&2; exit 1; }
 # A failed action's record still has the HOL child's phases and the resume.
 for step in resfpn resstepn resboundary holload holsalvage holrewind holleaves holtactics holprint holsave resbyten \
-            reset cap rstmodhash rstmodhashn holplan holreplay holresume holgap holtail holexit holdriver; do
+            reset cap rstmodhash holplan holreplay holresume holgap holtail holexit holdriver; do
   grep -qE "^phase-ms=(.*,)?$step:[0-9]+(,|\$)" "$tmpdir/v4a.result" || {
     echo "v4a's record lacks phase $step:" >&2; cat "$tmpdir/v4a.result" >&2; exit 1; }
 done
