@@ -471,7 +471,9 @@ v4b_steps=$(restored_steps v4b)
 # Under machine memory admission a resumed check's record has the time its
 # child took to be admitted, and holload starts once it was: here first with
 # nothing else reserved, then behind a lease filling the budget for 5 s from
-# when the worker starts waiting.
+# when the worker starts waiting.  The third waits in the same way but in the
+# toolchain's base-state probe before the hol phase, which holadmit leaves
+# out.
 coop=$tmpdir/coop
 mkdir -p "$coop"
 admitted() {
@@ -481,32 +483,42 @@ admitted() {
   expect "$1" 1 "status=failed" "failure=proof"
   resumed "$1" "failed-prefix checkpoint in t3" "failed_prefix checkpoint"
 }
+held_admitted() {
+  local name=$1 held_pid
+  printf '%s\n' $((2048 * 1024 * 1024)) > "$coop/lease-held"
+  rm -f "$tmpdir/lease-held"
+  (flock 9; touch "$tmpdir/lease-held"
+   for _ in $(seq 1 600); do
+     grep -qs 'waiting for machine memory' "$tmpdir/$name.log" && break
+     sleep 0.1
+   done
+   sleep 5) 9< "$coop/lease-held" &
+  held_pid=$!
+  for _ in $(seq 1 100); do [[ -e "$tmpdir/lease-held" ]] && break; sleep 0.1; done
+  require_file "$tmpdir/lease-held"
+  admitted "$name"
+  wait "$held_pid"
+  require_grep "waiting for machine memory" "$tmpdir/$name.log"
+}
 admitted admit-free
-printf '%s\n' $((2048 * 1024 * 1024)) > "$coop/lease-held"
-(flock 9; touch "$tmpdir/lease-held"
- for _ in $(seq 1 600); do
-   grep -qs 'waiting for machine memory' "$tmpdir/admit-held.log" && break
-   sleep 0.1
- done
- sleep 5) 9< "$coop/lease-held" &
-held_pid=$!
-for _ in $(seq 1 100); do [[ -e "$tmpdir/lease-held" ]] && break; sleep 0.1; done
-require_file "$tmpdir/lease-held"
-admitted admit-held
-wait "$held_pid"
-require_grep "waiting for machine memory" "$tmpdir/admit-held.log"
-PYTHONPATH="$HOLBUILD_ROOT/remote-exec" python3 - "$tmpdir/admit-free.result" "$tmpdir/admit-held.result" <<'PY'
+held_admitted admit-held
+rm -rf "$shared/toolchain-base-loaded"
+held_admitted admit-probe
+PYTHONPATH="$HOLBUILD_ROOT/remote-exec" python3 - "$tmpdir/admit-free.result" "$tmpdir/admit-held.result" \
+  "$tmpdir/admit-probe.result" <<'PY'
 import pathlib,sys
 from remote_exec.formats import parse_result
-free,held=(parse_result(pathlib.Path(p).read_text()).timings for p in sys.argv[1:])
+free,held,probe=(parse_result(pathlib.Path(p).read_text()).timings for p in sys.argv[1:])
 assert free['holadmit'] < 2000, free
 assert held['holadmit'] >= 5000, held
 assert held['holload'] < held['holadmit'], held
 assert held['holload'] < free['holload'] + 2500, (free, held)
+assert probe['holadmit'] < 2000, probe
 # The wait is a part of the hol phase, beside the ones v4a's add up to.
 parts = ('holdriver holadmit holload holplan holreplay holresume holgap holsalvage holrewind holleaves '
          'holtactics holprint holsave holtail holexit').split()
-assert abs(held['hol'] - sum(held.get(p, 0) for p in parts)) <= 20, held
+for timings in (held, probe):
+    assert abs(timings['hol'] - sum(timings.get(p, 0) for p in parts)) <= 20, timings
 PY
 
 # A spec of build --no-checkpoint-saves: the worker resumes from the shared

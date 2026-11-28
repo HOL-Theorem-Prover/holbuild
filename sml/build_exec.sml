@@ -16906,8 +16906,6 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
     val _ = HolbuildOffline.require_online "execute a remote action"
     val _ = HolbuildRemoteCache.fail_closed := true
     val start = Time.now ()
-    val admissions_before = !HolbuildMachineMemory.admissions
-    val admission_ms_before = !HolbuildMachineMemory.admission_ms
     val remote =
       case HolbuildRemoteCacheConfig.url () of
           SOME url => HolbuildRemoteCache.remote url
@@ -16928,15 +16926,26 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
        which is not HOL's and is left out of the phase's time, not its
        span. *)
     val hol_hydrate_ms = ref (0 : LargeInt.int)
+    (* How many children the hol phases had admitted, and the milliseconds
+       they waited for it: holadmit, one of the hol phase's parts. *)
+    val hol_admissions = ref 0
+    val hol_admission_ms = ref (0 : LargeInt.int)
     fun phase name f =
       let
         val _ = if name = "publish" orelse name = "log" then () else check_cancelled ()
         val t0 = Time.now ()
         val _ = if name = "hol" then hol_hydrate_ms := 0 else ()
+        val admissions0 = !HolbuildMachineMemory.admissions
+        val admission_ms0 = !HolbuildMachineMemory.admission_ms
         fun record () =
           let val ended = Time.now ()
               val ms = Time.toMilliseconds (Time.-(ended, t0))
               val _ = if name = "hydrate" then hol_hydrate_ms := !hol_hydrate_ms + ms else ()
+              val _ =
+                if name = "hol" then
+                  (hol_admissions := !hol_admissions + !HolbuildMachineMemory.admissions - admissions0;
+                   hol_admission_ms := !hol_admission_ms + !HolbuildMachineMemory.admission_ms - admission_ms0)
+                else ()
               val excluded = if name = "hol" then !hol_hydrate_ms else 0
               val spans = if List.exists (fn n => n = name) ["hol", "publish", "log"] then
                   [(name ^ "start", Time.toMilliseconds t0), (name ^ "end", Time.toMilliseconds ended)]
@@ -18323,11 +18332,10 @@ fun exec_action {spec_sha256, result_file, cache_cap, share_heaps, deps_heap_onl
               fun count (name, n) = if !n > 0 then [(name, LargeInt.fromInt (!n))] else []
               val drops = count ("rstdropn", dropped_checkpoints) @ count ("rstmodrejn", rejected_heap_modules) @
                           count ("pubckptn", published_checkpoints)
-              (* holadmit: the time the action's children waited for their
-                 machine memory reservations, which holload leaves out. *)
-              val admission =
-                if !HolbuildMachineMemory.admissions = admissions_before then []
-                else [("holadmit", !HolbuildMachineMemory.admission_ms - admission_ms_before)]
+              (* holadmit: the time the hol phases' children waited for
+                 their machine memory reservations, which holload leaves
+                 out. *)
+              val admission = if !hol_admissions = 0 then [] else [("holadmit", !hol_admission_ms)]
               val _ = phases := rev (admission @ hol_phases @ !resume_steps @ drops) @ !phases
               val merged = merge_phases (rev (!phases))
               (* The hol phases' time outside their HOL children: the
